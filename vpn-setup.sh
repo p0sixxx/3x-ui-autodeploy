@@ -1352,6 +1352,116 @@ do_check() {
     (( N_FAIL == 0 ))
 }
 
+# ---------------------------------------------------------------- vpn trace
+# Запись соединений клиентов на порты VPN и разбор: дошло ли до сервера, ответил ли он,
+# не теряются ли ответы (ретрансмиты), кто оборвал соединение.
+trace_summary() { # trace_summary <pcap> "<адреса сервера>"
+    tcpdump -nn -tttt -r "$1" 2>/dev/null | awk -v srvs="$2" '
+    BEGIN { n = split(srvs, a, " "); for (i = 1; i <= n; i++) srv[a[i]] = 1 }
+    {
+        s = ""; d = ""
+        for (i = 1; i <= NF; i++) if ($i == ">") { s = $(i-1); d = $(i+1); break }
+        if (s == "") next
+        sub(/:$/, "", d)
+        sp = s; sub(/.*\./, "", sp); sa = s; sub(/\.[0-9]+$/, "", sa)
+        dp = d; sub(/.*\./, "", dp); da = d; sub(/\.[0-9]+$/, "", da)
+        proto = ($0 ~ / UDP,/ || $0 ~ / udp /) ? "udp" : "tcp"
+        if (srv[da]) { dir = "in"; c = sa ":" sp; lp = dp } else if (srv[sa]) { dir = "out"; c = da ":" dp; lp = sp } else next
+        split($2, t, ":"); ts = t[1] * 3600 + t[2] * 60 + t[3]
+        len = 0; for (i = 1; i <= NF; i++) if ($i == "length") len = $(i+1) + 0
+        f = proto " " c " " lp
+        if (!(f in first)) { first[f] = ts; hms[f] = substr($2, 1, 8); order[++nf] = f; cli[f] = c; port[f] = lp; pr[f] = proto }
+        last[f] = ts
+        if (dir == "in") { inp[f]++; inb[f] += len } else { outp[f]++; outb[f] += len }
+        if (proto == "tcp") {
+            fl = ""; if (match($0, /Flags \[[^]]*\]/)) fl = substr($0, RSTART + 7, RLENGTH - 8)
+            if (fl ~ /R/ && !(f in rst)) rst[f] = dir
+            if (fl ~ /F/ && !(f in fin)) fin[f] = dir
+            if (fl == "S" && dir == "in") syn[f]++
+            if (fl == "S." && dir == "out") synack[f]++
+            if (match($0, /seq [0-9]+:[0-9]+/)) {
+                split(substr($0, RSTART + 4, RLENGTH - 4), q, ":"); e = q[2] + 0
+                if (dir == "out") { if (e <= maxo[f]) ro[f]++; else maxo[f] = e }
+                else { if (e <= maxi[f]) ri[f]++; else maxi[f] = e }
+            }
+        }
+    }
+    function kb(x) { x += 0; return x < 1024 ? x "B" : sprintf("%.1fK", x / 1024) }
+    END {
+        if (!nf) { print "  Ни одного пакета от клиентов на порты VPN — до сервера ничего не дошло."; exit }
+        printf "  %-8s %-4s %-5s %-23s %5s %15s %15s %5s  %s\n", "время", "прот", "порт", "клиент", "сек", "к серверу", "от сервера", "повт", "итог"
+        bad = 0
+        for (k = 1; k <= nf; k++) {
+            f = order[k]; v = ""
+            if (pr[f] == "udp") {
+                v = outp[f] ? "ok" : "СЕРВЕР НЕ ОТВЕТИЛ"
+            } else if (!outp[f]) {
+                v = "СЕРВЕР НЕ ОТВЕТИЛ (SYN x" syn[f] + 0 ")"
+            } else if (syn[f] && !synack[f] && rst[f] == "out") {
+                v = "порт закрыт (сервер ответил RST)"
+            } else if (!inb[f] && !outb[f]) {
+                v = (rst[f] == "in") ? "клиент сбросил сразу после TCP-рукопожатия" : "TCP-рукопожатие есть, данных нет"
+            } else if (inb[f] && !outb[f]) {
+                v = "СЕРВЕР МОЛЧИТ на данные клиента"
+            } else if (ro[f] >= 3) {
+                v = "ОТВЕТЫ НЕ ДОХОДЯТ ДО КЛИЕНТА (повторы сервера)"
+            } else if (outb[f] < 2000 && rst[f] == "in") {
+                v = "клиент оборвал на рукопожатии TLS"
+            } else v = "ok"
+            if (v ~ /^порт закрыт/) {}
+            else if (fin[f] == "out" || rst[f] == "out") v = v ", закрыл сервер"
+            else if (rst[f] == "in") v = v ", RST от клиента"
+            if (v !~ /^ok/) bad++
+            printf "  %-8s %-4s %-5s %-23s %5.1f %6dп %7s %6dп %7s %5s  %s\n", hms[f], pr[f], port[f], cli[f], last[f] - first[f], inp[f], kb(inb[f]), outp[f], kb(outb[f]), (ro[f] + 0) "/" (ri[f] + 0), v
+        }
+        printf "\n  Соединений: %d, проблемных: %d\n", nf, bad
+    }'
+}
+
+do_trace() {
+    local ip="" sec=120 a
+    for a in "$@"; do
+        if [[ $a =~ ^[0-9]+$ ]]; then sec=$a
+        elif [[ $a =~ ^[0-9a-fA-F.:]+$ ]]; then ip=$a
+        else echo "Использование: vpn trace [IP клиента] [секунд, по умолчанию 120]"; exit 1; fi
+    done
+    command -v tcpdump >/dev/null || { echo "Ставлю tcpdump…"; apt-get install -y tcpdump >/dev/null 2>&1 || { apt-get update >/dev/null 2>&1; apt-get install -y tcpdump >/dev/null 2>&1; }; }
+    command -v tcpdump >/dev/null || { echo "Не удалось установить tcpdump"; exit 1; }
+    local addrs h tin tout uin uout filt f cap live
+    addrs=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -v '^fe80' | xargs)
+    [[ -n "$addrs" ]] || addrs=${SERVER_IP:-}
+    tin="tcp dst port 443${XHTTP_PORT:+ or tcp dst port $XHTTP_PORT}"
+    tout="tcp src port 443${XHTTP_PORT:+ or tcp src port $XHTTP_PORT}"
+    uin="udp dst port 443${HOP_PORTS:+ or udp dst portrange $HOP_PORTS}"
+    uout="udp src port 443${HOP_PORTS:+ or udp src portrange $HOP_PORTS}"
+    filt=""
+    for h in $addrs; do
+        filt+="${filt:+ or }(dst host $h and ($tin or $uin)) or (src host $h and ($tout or $uout))"
+    done
+    filt="($filt)"
+    [[ -n "$ip" ]] && filt+=" and host $ip"
+    f=$(mktemp /tmp/vpn-trace.XXXXXX.pcap)
+    local awki=(awk)   # mawk (по умолчанию в Ubuntu) буферизует ввод — без -W interactive строки придут только в конце
+    awk -W interactive 'BEGIN{}' >/dev/null 2>&1 && awki=(awk -W interactive)
+    echo "Записываю соединения ${ip:-всех клиентов} на порты VPN ${sec} с (Ctrl+C — закончить раньше)."
+    echo "Сейчас жми проверку пинга в клиенте и запомни время, когда серверы были n/a."
+    echo "Новые подключения (время сервера $(date +%H:%M:%S)):"
+    tcpdump --immediate-mode -nni any -U -s 128 -c 500000 -w "$f" "$filt" 2>/dev/null & cap=$!
+    tcpdump --immediate-mode -lnni any "$filt and inbound and ((tcp[tcpflags] & (tcp-syn|tcp-ack)) == tcp-syn or udp)" 2>/dev/null \
+      > >("${awki[@]}" 'NF<5{next} {for(i=1;i<=NF;i++) if($i==">"){s=$(i-1);d=$(i+1)}; ip=s; sub(/\.[0-9]+$/,"",ip); p=d; sub(/:$/,"",p); sub(/.*\./,"",p); pr=($0~/Flags/)?"tcp":"udp"; k=ip" "pr"/"p; t=substr($1,1,7); if(last[k]!=t){last[k]=t; print "  " substr($1,1,8), ip, pr"/"p; fflush()}}') & live=$!
+    trap ':' INT
+    sleep "$sec" || true
+    trap - INT
+    kill "$cap" "$live" 2>/dev/null || true
+    wait "$cap" "$live" 2>/dev/null || true
+    sleep 0.3
+    echo
+    echo "Разбор по соединениям (повт = повторы пакетов сервер/клиент):"
+    trace_summary "$f" "$addrs"
+    echo
+    echo "Запись сохранена: $f (удалить: rm $f)"
+}
+
 usage() {
     cat <<EOF
 vpn add <имя> <ГБ> <дней> [комментарий] [--devices N] [--ips N]
@@ -1368,6 +1478,7 @@ vpn off|on <имя>                         — отключить / включ�
 vpn del <имя>                            — удалить
 vpn panel                                — адрес и логин панели
 vpn check [--local]                      — полная диагностика (--local: без проверки снаружи)
+vpn trace [IP] [секунд]                  — запись подключений клиентов и разбор: дошло ли, ответил ли сервер
 vpn reality [auto|<домен>|<ip:443> <домен>] — маскировка Reality: показать / подобрать в сети хостера / задать
 vpn brand                                — подпись подписки и названия серверов (мастер с вопросами)
 vpn brand --show                         — показать текущие
@@ -1392,6 +1503,7 @@ brand) load_env; do_brand "$@" ;;
 xhttp) load_env; do_xhttp "$@" ;;
 hop) load_env; do_hop "$@" ;;
 fastest) load_env; do_fastest "$@" ;;
+trace) load_env; do_trace "$@" ;;
 _hop) hop_rules "${1:-up}" "${2:-20000-50000}" ;;
 _country) country_label "${1:-}" ;;
 add)
