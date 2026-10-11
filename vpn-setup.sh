@@ -861,7 +861,7 @@ main{max-width:34rem;padding:2rem;text-align:center}h1{font-weight:600;font-size
 HTML
     printf 'User-agent: *\nDisallow: /\n' > "$SELF_WWW/robots.txt"
 }
-self_nginx() { # <домен> <порт>
+self_nginx_install() { # до выпуска сертификата: acme.sh вызывает «systemctl reload nginx»
     if ! command -v nginx >/dev/null; then
         echo "  Ставлю nginx…"
         DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx >/dev/null 2>&1 \
@@ -869,7 +869,14 @@ self_nginx() { # <домен> <порт>
             || { echo "Не удалось установить nginx"; exit 1; }
     fi
     # стандартный сайт nginx занимает 80/tcp, а он нужен Let's Encrypt для выпуска и продления
-    rm -f /etc/nginx/sites-enabled/default
+    if [[ -e /etc/nginx/sites-enabled/default ]]; then
+        rm -f /etc/nginx/sites-enabled/default
+        systemctl restart nginx >/dev/null 2>&1 || true
+    fi
+    systemctl enable nginx >/dev/null 2>&1 || true
+    systemctl is-active --quiet nginx 2>/dev/null || systemctl start nginx >/dev/null 2>&1 || true
+}
+self_nginx() { # <домен> <порт>
     local h2="listen 127.0.0.1:$2 ssl http2;" v
     v=$(nginx -v 2>&1 | grep -Eo '[0-9]+\.[0-9]+' | head -1)
     if [[ -n "$v" ]] && (( ${v%.*} > 1 || ${v#*.} >= 25 )); then h2="listen 127.0.0.1:$2 ssl;
@@ -938,6 +945,7 @@ do_reality_self() { # <домен>
     echo "  DNS: $d → ${SERVER_IP}"
     port=$(self_free_port) || { echo "Не нашёл свободный локальный порт для сайта-маскировки"; exit 1; }
     self_site "$d"
+    self_nginx_install
     self_cert "$d"
     self_nginx "$d" "$port"
     local i
