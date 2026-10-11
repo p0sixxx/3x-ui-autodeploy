@@ -584,13 +584,93 @@ save_client() { # полное обновление (update заменяет з�
         tgId, comment, reset, enable, totalGB, expiryTime}' <<<"$c")")"
 }
 
-add_client() { # add_client <имя> <ГБ> <дней> [комментарий]
+add_client() { # add_client <имя> <ГБ> <дней> [комментарий] [устройств] [IP]
     local exp=0
     [[ "$3" != 0 ]] && exp=$(( $(now_ms) + ${3%.*} * 86400000 ))
     ok "$(api_json POST /clients/add "$(jq -n --arg e "$1" --arg sub "$(openssl rand -hex 8)" --arg gb "$2" \
         --argjson exp "$exp" --arg cm "${4:-}" --argjson ib "$INBOUNDS" --argjson G $GiB \
+        --argjson dev "${5:-0}" --argjson ips "${6:-0}" \
         '{client: {email: $e, subId: $sub, flow: "xtls-rprx-vision", totalGB: (($gb|tonumber) * $G | floor),
-          expiryTime: $exp, limitIp: 0, limitHwid: 0, tgId: 0, comment: $cm, enable: true}, inboundIds: $ib}')")"
+          expiryTime: $exp, limitIp: $ips, limitHwid: $dev, tgId: 0, comment: $cm, enable: true}, inboundIds: $ib}')")"
+}
+
+# ---------------------------------------------------------------- лимиты устройств и IP
+parse_limits() { # вынимает --devices N и --ips N, остальные аргументы → REST
+    DEV=""; IPS=""; REST=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --devices|--ips)
+                [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || { echo "$1: нужно число (0 — без ограничения)"; exit 1; }
+                if [[ "$1" == --devices ]]; then DEV=$2; else IPS=$2; fi
+                shift 2 ;;
+            *) REST+=("$1"); shift ;;
+        esac
+    done
+}
+limits_text() { # <устройств> <IP>
+    local d="без лимита" i="без лимита"
+    (( ${1:-0} > 0 )) && d="$1"
+    (( ${2:-0} > 0 )) && i="$2"
+    echo "устройств: ${d}, одновременных IP: ${i}"
+}
+hwid_note() {
+    echo "Подписку на новом устройстве выдаст только клиент, передающий ID устройства (Happ, INCY, v2RayTun)."
+    echo "Клиенты без этого (sing-box, роутеры с Podkop/Tachyon) при лимите устройств подписку не получат."
+}
+fail2ban_note() {
+    if ! systemctl is-active --quiet fail2ban 2>/dev/null; then
+        echo "Внимание: fail2ban не запущен — лимит IP не сработает. Включить: x-ui → IP Limit Management → Install."
+    fi
+}
+set_limits() { # <имя> — применяет DEV/IPS
+    local c; c=$(get_client "$1")
+    if [[ -n "$DEV" ]]; then c=$(jq --argjson d "$DEV" '.limitHwid = $d' <<<"$c"); fi
+    if [[ -n "$IPS" ]]; then c=$(jq --argjson i "$IPS" '.limitIp = $i' <<<"$c"); fi
+    save_client "$c"
+}
+do_limit() {
+    parse_limits "$@"; set -- "${REST[@]+"${REST[@]}"}"
+    local who=${1:-} c e n=0
+    [[ -n "$who" ]] || { usage; exit 1; }
+    if [[ -z "$DEV" && -z "$IPS" ]]; then
+        if [[ "$who" == default ]]; then echo "Для новых пользователей: $(limits_text "${DEF_DEVICES:-0}" "${DEF_IPS:-0}")"
+        else check_name "$who"; c=$(get_client "$who"); echo "$who: $(limits_text "$(jq -r '.limitHwid // 0' <<<"$c")" "$(jq -r '.limitIp // 0' <<<"$c")")"; fi
+        return
+    fi
+    case "$who" in
+        default)
+            if [[ -n "$DEV" ]]; then env_set DEF_DEVICES "$DEV"; fi
+            if [[ -n "$IPS" ]]; then env_set DEF_IPS "$IPS"; fi
+            echo "Для новых пользователей: $(limits_text "${DEF_DEVICES:-0}" "${DEF_IPS:-0}")" ;;
+        all)
+            for e in $(all_emails | jq -r '.[]'); do
+                [[ "$e" == "$HC_USER" || "$e" == me ]] && continue
+                set_limits "$e"; n=$((n + 1))
+            done
+            echo "Применено к ${n} пользователям (кроме me)." ;;
+        *)
+            check_name "$who"; set_limits "$who"
+            c=$(get_client "$who")
+            echo "$who: $(limits_text "$(jq -r '.limitHwid // 0' <<<"$c")" "$(jq -r '.limitIp // 0' <<<"$c")")" ;;
+    esac
+    if [[ -n "$DEV" ]] && (( DEV > 0 )); then hwid_note; fi
+    if [[ -n "$IPS" ]] && (( IPS > 0 )); then fail2ban_note; fi
+}
+do_devices() {
+    local name=${1:-} r lim
+    check_name "$name"
+    case "${2:-}" in
+        reset) ok "$(api DELETE "/clients/hwids/$name")"; echo "Устройства $name сброшены — можно подключать заново." ;;
+        "")
+            r=$(api POST "/clients/hwids/$name"); ok "$r"
+            lim=$(get_client "$name" | jq -r '.limitHwid // 0')
+            echo "$name: устройств $(jq '.obj | length' <<<"$r") из $( (( lim > 0 )) && echo "$lim" || echo "∞")"
+            jq -r '.obj[]? | "  #\(.id)  \([.deviceModel, .deviceOs, .osVersion] | map(select(. != "" and . != null)) | join(" "))  \(.userAgent)  последний раз: \(.lastSeen / 1000 | strflocaltime("%d.%m %H:%M"))"' <<<"$r"
+            echo "Удалить одно: vpn devices $name <номер>; все: vpn devices $name reset" ;;
+        *)
+            [[ "$2" =~ ^[0-9]+$ ]] || { echo "Номер устройства — число из списка vpn devices $name"; exit 1; }
+            ok "$(api DELETE "/clients/hwids/$name/$2")"; echo "Устройство #$2 удалено у $name." ;;
+    esac
 }
 
 # ---------------------------------------------------------------- внешние проверки (check-host.net)
@@ -1017,6 +1097,10 @@ do_check() {
         r_warn "ufw выключен (работать будет, но сервер без фаервола)"
     fi
 
+    if api GET /clients/list 2>/dev/null | jq -e '[.obj[]? | select((.limitIp // 0) > 0)] | length > 0' >/dev/null 2>&1; then
+        systemctl is-active --quiet fail2ban 2>/dev/null && r_ok "fail2ban работает (нужен для лимита IP)" \
+            || r_fail "fail2ban не запущен — лимит IP не работает: x-ui → IP Limit Management → Install"
+    fi
     echo "— Система"
     [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == yes ]] && r_ok "Время синхронизировано" \
         || r_warn "Время не синхронизировано по NTP: timedatectl set-ntp true"
@@ -1128,7 +1212,12 @@ do_check() {
 
 usage() {
     cat <<EOF
-vpn add <имя> <ГБ> <дней> [комментарий]  — новый пользователь (0 = без лимита / бессрочно)
+vpn add <имя> <ГБ> <дней> [комментарий] [--devices N] [--ips N]
+                                         — новый пользователь (0 = без лимита / бессрочно)
+vpn limit <имя|all|default> [--devices N] [--ips N]
+                                         — лимит устройств (по ID устройства) и одновременных IP;
+                                           all — всем, кроме me; default — для новых пользователей
+vpn devices <имя> [reset|<номер>]        — устройства пользователя: список / сбросить все / удалить одно
 vpn list                                 — все пользователи, трафик, сроки
 vpn link <имя>                           — ссылка подписки + QR
 vpn renew <имя> <дней> [ГБ]              — продлить и обнулить трафик (ГБ — новый лимит)
@@ -1159,26 +1248,34 @@ _hop) hop_rules "${1:-up}" "${2:-20000-50000}" ;;
 _country) country_label "${1:-}" ;;
 add)
     load_env
+    parse_limits "$@"; set -- "${REST[@]+"${REST[@]}"}"
     [[ $# -ge 3 ]] || { usage; exit 1; }
     check_name "$1"; is_num "$2" && is_num "$3" || { echo "ГБ и дни — числа"; exit 1; }
-    add_client "$@"
-    echo "Создан: $1 (лимит: $([[ $2 == 0 ]] && echo без лимита || echo "$2 ГБ"), срок: $([[ $3 == 0 ]] && echo бессрочно || echo "$3 дн."))"
+    dev=${DEV:-${DEF_DEVICES:-0}}; ips=${IPS:-${DEF_IPS:-0}}
+    add_client "$1" "$2" "$3" "${4:-}" "$dev" "$ips"
+    echo "Создан: $1 (трафик: $([[ $2 == 0 ]] && echo без лимита || echo "$2 ГБ"), срок: $([[ $3 == 0 ]] && echo бессрочно || echo "$3 дн."), $(limits_text "$dev" "$ips"))"
+    if (( dev > 0 )); then hwid_note; fi
+    if (( ips > 0 )); then fail2ban_note; fi
     show_link "$1"
     ;;
+limit) load_env; do_limit "$@" ;;
+devices) load_env; do_devices "$@" ;;
 list)
     load_env
     r=$(api GET /clients/list); ok "$r"
     tab() { if command -v column >/dev/null; then column -t -s $'\t'; else cat; fi; }
     {
-    printf 'ИМЯ\tВКЛ\tИСПОЛЬЗ.\tЛИМИТ\tДО\tКОММЕНТАРИЙ\n'
+    printf 'ИМЯ\tВКЛ\tИСПОЛЬЗ.\tЛИМИТ\tДО\tУСТР./IP\tКОММЕНТАРИЙ\n'
     jq -r --argjson G $GiB --arg hc "$HC_USER" '.obj[] | select(.email != $hc) | [ .email,
         (if .enable and (.traffic.enable // true) then "да" else "нет" end),
         ((((.traffic.up // 0) + (.traffic.down // 0)) / $G * 100 | floor) / 100 | tostring) + " ГБ",
         (if .totalGB > 0 then ((.totalGB / $G * 100 | floor) / 100 | tostring) + " ГБ" else "∞" end),
-        (.expiryTime // 0 | tostring), (if (.comment // "") == "" then "-" else .comment end) ] | @tsv' <<<"$r" |
-    while IFS=$'\t' read -r n e u t x cm; do
+        (.expiryTime // 0 | tostring),
+        ((if (.limitHwid // 0) > 0 then (.limitHwid | tostring) else "∞" end) + "/" + (if (.limitIp // 0) > 0 then (.limitIp | tostring) else "∞" end)),
+        (if (.comment // "") == "" then "-" else .comment end) ] | @tsv' <<<"$r" |
+    while IFS=$'\t' read -r n e u t x lm cm; do
         if [[ "$x" == 0 ]]; then d="бессрочно"; elif (( x < 0 )); then d="с_1-го_подкл."; else d=$(date -d "@$((x/1000))" '+%d.%m.%Y_%H:%M'); fi
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$n" "$e" "$u" "$t" "$d" "$cm"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$n" "$e" "$u" "$t" "$d" "$lm" "$cm"
     done
     } | tab
     ;;
