@@ -1233,6 +1233,8 @@ vpn brand [--title Т] [--announce Т] [--support @user|URL|-] [--site URL|по�
           [--vless-name Т] [--hy2-name Т] [--xhttp-name Т] [--auto-names]   — то же флагами
 vpn xhttp on [порт] | off                — доп. сервер VLESS + XHTTP + Reality (по умолчанию порт 8443)
 vpn hop on [от-до] | off                 — port hopping для Hysteria2 (по умолчанию UDP 20000-50000)
+vpn help                                 — эта справка
+Подробный гайд: https://github.com/p0sixxx/3x-ui-autodeploy/blob/main/docs/vpn-commands.md
 EOF
 }
 
@@ -1286,7 +1288,7 @@ renew)
     check_name "$1"; is_num "$2" || { echo "Дни — число"; exit 1; }
     c=$(get_client "$1"); cur=$(jq -r '.expiryTime // 0' <<<"$c"); base=$(now_ms)
     (( cur > base )) && base=$cur
-    if (( cur == 0 && ${2%.*} == 0 )); then exp=0; else exp=$(( base + ${2%.*} * 86400000 )); fi
+    if (( ${2%.*} == 0 )); then exp=$cur; else exp=$(( base + ${2%.*} * 86400000 )); fi
     c=$(jq --argjson exp "$exp" '.expiryTime = $exp | .enable = true' <<<"$c")
     if [[ -n "${3:-}" ]]; then is_num "$3" || { echo "ГБ — число"; exit 1; }
         c=$(jq --arg gb "$3" --argjson G $GiB '.totalGB = (($gb|tonumber) * $G | floor)' <<<"$c"); fi
@@ -1294,6 +1296,7 @@ renew)
     ok "$(api POST "/clients/resetTraffic/$1")"
     if [[ "$exp" == 0 ]]; then until_s="бессрочно"; else until_s="до $(date -d "@$(( exp / 1000 ))" '+%d.%m.%Y %H:%M')"; fi
     echo "Продлён: $1, ${until_s}, трафик обнулён"
+    if (( exp > 0 && exp < $(now_ms) )); then echo "Внимание: срок уже истёк — пользователь не подключится. Продли на N дней: vpn renew $1 30"; fi
     ;;
 reset) load_env; check_name "${1:-}"; ok "$(api POST "/clients/resetTraffic/$1")"; echo "Трафик $1 обнулён" ;;
 off|on)
