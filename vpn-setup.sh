@@ -800,9 +800,10 @@ do_reality() {
     if [[ $# -eq 0 ]]; then
         rs=$(reality_settings)
         echo "Сейчас: SNI $(jq -r '.serverNames | join(",")' <<<"$rs"), target $(jq -r '.target // .dest' <<<"$rs")"
-        echo "Сменить: vpn reality auto | vpn reality <домен> | vpn reality <ip:443> <домен>"
+        echo "Сменить: vpn reality self <свой домен> | vpn reality auto | vpn reality <домен> | vpn reality <ip:443> <домен>"
         return
     fi
+    if [[ "$1" == self ]]; then do_reality_self "${2:-}"; return; fi
     if [[ "$1" == auto ]]; then
         echo "Ищу сайты с TLS 1.3 + h2 + X25519 в сети сервера (${SERVER_IP%.*}.0/24 и соседние), до 2–3 минут…"
         found=$(reality_scan || true)
@@ -822,8 +823,131 @@ do_reality() {
         risky_sni "$sni" && echo "Внимание: ${sni} — крупный CDN, на чужом IP его часто блокируют в РФ."
     fi
     reality_apply "$t" "$sni"
+    [[ -n "${SELF_DOMAIN:-}" ]] && env_set SELF_DOMAIN ""
     echo "Маскировка сменена: SNI ${sni}, target ${t}."
     echo "Клиентам нужно обновить подписку (SNI в ссылке поменялся). Проверка: vpn check --local"
+}
+
+# ---------------------------------------------------------------- Reality на свой домен (self-steal)
+# SNI = свой домен, A-запись которого указывает на этот сервер; маскировка — свой сайт на localhost
+# с настоящим сертификатом Let's Encrypt. SNI совпадает с IP — DPI не за что зацепиться.
+SELF_DIR=/etc/vpn/self
+SELF_WWW=/var/www/vpn-self
+SELF_NGINX=/etc/nginx/conf.d/vpn-self.conf
+ACME_SH=${ACME_SH:-/root/.acme.sh/acme.sh}
+self_ipv4() { { getent ahostsv4 "$1" 2>/dev/null || true; } | awk '{print $1}' | sort -u | xargs; }
+self_ipv6() { { getent ahostsv6 "$1" 2>/dev/null || true; } | awk '$1 !~ /^::ffff:/ {print $1}' | sort -u | xargs; }
+self_https_ok() { # <домен> <порт> — сайт отвечает по TLS с проверкой сертификата и по HTTP/2
+    [[ "$(curl -s --noproxy '*' -o /dev/null --max-time 8 --http2 -w '%{http_version}' --resolve "$1:$2:127.0.0.1" "https://$1:$2/" 2>/dev/null)" == 2 ]]
+}
+self_free_port() { # порт из прошлого запуска (наш nginx уже на нём) или первый свободный
+    local p
+    p=$(grep -so 'listen 127.0.0.1:[0-9]*' "$SELF_NGINX" | head -1 | cut -d: -f2)
+    [[ -n "$p" ]] && { echo "$p"; return; }
+    for p in 8444 8445 8446 9444 10443; do
+        [[ -z "$(ss -Hltn "sport = :$p" 2>/dev/null)" ]] && { echo "$p"; return; }
+    done
+    return 1
+}
+self_site() { # <домен> — нейтральная страница-заглушка
+    mkdir -p "$SELF_WWW"
+    cat > "$SELF_WWW/index.html" <<HTML
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>$1</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;font:16px/1.5 system-ui,sans-serif;background:#f6f7f9;color:#222}
+main{max-width:34rem;padding:2rem;text-align:center}h1{font-weight:600;font-size:1.6rem;margin:0 0 .5rem}p{color:#666;margin:0}</style>
+</head><body><main><h1>$1</h1><p>The site is under maintenance. Please check back later.</p></main></body></html>
+HTML
+    printf 'User-agent: *\nDisallow: /\n' > "$SELF_WWW/robots.txt"
+}
+self_nginx() { # <домен> <порт>
+    if ! command -v nginx >/dev/null; then
+        echo "  Ставлю nginx…"
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx >/dev/null 2>&1 \
+            || { apt-get update -qq >/dev/null 2>&1; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx >/dev/null 2>&1; } \
+            || { echo "Не удалось установить nginx"; exit 1; }
+    fi
+    # стандартный сайт nginx занимает 80/tcp, а он нужен Let's Encrypt для выпуска и продления
+    rm -f /etc/nginx/sites-enabled/default
+    local h2="listen 127.0.0.1:$2 ssl http2;" v
+    v=$(nginx -v 2>&1 | grep -Eo '[0-9]+\.[0-9]+' | head -1)
+    if [[ -n "$v" ]] && (( ${v%.*} > 1 || ${v#*.} >= 25 )); then h2="listen 127.0.0.1:$2 ssl;
+    http2 on;"; fi
+    cat > "$SELF_NGINX" <<NGX
+# vpn reality self — сайт-маскировка Reality, доступен только через Xray (порт 443)
+server {
+    $h2
+    server_name $1;
+    server_tokens off;
+    ssl_certificate     $SELF_DIR/fullchain.pem;
+    ssl_certificate_key $SELF_DIR/key.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ecdh_curve X25519:prime256v1:secp384r1;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:VPNSELF:10m;
+    root $SELF_WWW;
+    index index.html;
+    location / { try_files \$uri \$uri/ =404; }
+}
+NGX
+    nginx -t >/dev/null 2>&1 || { nginx -t; echo "Конфиг nginx с ошибкой: $SELF_NGINX"; exit 1; }
+    systemctl enable nginx >/dev/null 2>&1 || true
+    systemctl restart nginx >/dev/null 2>&1 || { echo "nginx не запустился: journalctl -u nginx -n 30"; exit 1; }
+}
+self_cert() { # <домен> — выпуск через 80/tcp (standalone), автопродление через cron acme.sh
+    if [[ ! -x "$ACME_SH" ]]; then
+        echo "  Ставлю acme.sh…"
+        curl -fsSL https://get.acme.sh | sh -s email="admin@$1" >/dev/null 2>&1 || true
+        [[ -x "$ACME_SH" ]] || { echo "Не удалось установить acme.sh"; exit 1; }
+    fi
+    if [[ -n "$(ss -Hltn 'sport = :80' 2>/dev/null)" ]]; then
+        echo "Порт 80/tcp занят ($(ss -Hltnp 'sport = :80' 2>/dev/null | grep -o 'users:(("[^"]*' | cut -d'"' -f2 | head -1)) — Let's Encrypt не сможет проверить домен. Освободи его и повтори."
+        exit 1
+    fi
+    mkdir -p "$SELF_DIR"; chmod 700 "$SELF_DIR"
+    echo "  Получаю сертификат Let's Encrypt для $1 (через 80/tcp)…"
+    local rc=0 log=/var/log/vpn-self-acme.log
+    "$ACME_SH" --issue -d "$1" --standalone --httpport 80 --server letsencrypt --keylength ec-256 >"$log" 2>&1 || rc=$?
+    # 2 — сертификат уже есть и продлевать рано
+    if (( rc != 0 && rc != 2 )); then
+        tail -15 "$log"
+        echo "Let's Encrypt не выдал сертификат (лог: $log). Проверь A-запись домена и что 80/tcp открыт у хостера."
+        exit 1
+    fi
+    "$ACME_SH" --install-cert -d "$1" --ecc --key-file "$SELF_DIR/key.pem" --fullchain-file "$SELF_DIR/fullchain.pem" \
+        --reloadcmd "systemctl reload nginx" >>"$log" 2>&1 || { tail -5 "$log"; echo "Не удалось установить сертификат (лог: $log)"; exit 1; }
+    chmod 600 "$SELF_DIR/key.pem"
+}
+do_reality_self() { # <домен>
+    local d=${1,,} ips v6 port
+    [[ "$d" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$ ]] || { echo "Использование: vpn reality self <домен>, например fi.example.xyz"; exit 1; }
+    echo "Reality на свой домен: $d"
+    ips=$(self_ipv4 "$d")
+    if [[ -z "$ips" ]]; then
+        echo "У $d нет A-записи. Создай у регистратора A-запись $d → ${SERVER_IP} и подожди 5–15 минут."; exit 1
+    fi
+    if [[ " $ips " != *" ${SERVER_IP} "* ]]; then
+        echo "A-запись $d указывает на ${ips}, а не на этот сервер (${SERVER_IP}). Исправь её у регистратора и подожди 5–15 минут."; exit 1
+    fi
+    [[ "$ips" == "${SERVER_IP}" ]] || echo "  Внимание: у $d несколько A-записей ($ips) — оставь только ${SERVER_IP}."
+    v6=$(self_ipv6 "$d")
+    if [[ -n "$v6" ]] && ! ip -6 addr show 2>/dev/null | grep -qw "${v6%% *}"; then
+        echo "  Внимание: у $d есть AAAA-запись ($v6), не принадлежащая серверу — удали её у регистратора."
+    fi
+    echo "  DNS: $d → ${SERVER_IP}"
+    port=$(self_free_port) || { echo "Не нашёл свободный локальный порт для сайта-маскировки"; exit 1; }
+    self_site "$d"
+    self_cert "$d"
+    self_nginx "$d" "$port"
+    local i
+    for i in 1 2 3 4 5; do self_https_ok "$d" "$port" && break; sleep 1; done
+    self_https_ok "$d" "$port" || { echo "Сайт-маскировка на 127.0.0.1:$port не отвечает по TLS 1.3 + HTTP/2 с проверкой сертификата (journalctl -u nginx)"; exit 1; }
+    echo "  Сайт-маскировка: https://$d (127.0.0.1:$port), сертификат до $(openssl x509 -in "$SELF_DIR/fullchain.pem" -noout -enddate | cut -d= -f2)"
+    reality_apply "127.0.0.1:$port" "$d"
+    env_set SELF_DOMAIN "$d"; env_set SELF_PORT "$port"
+    echo "Готово: SNI $d, маскировка — свой сайт (127.0.0.1:$port). Сертификат продлевается сам (cron acme.sh)."
+    echo "Клиентам нужно обновить подписку. Проверка: vpn check --local"
 }
 
 # ---------------------------------------------------------------- XHTTP и port hopping
@@ -1278,7 +1402,20 @@ do_check() {
     rs=$(reality_settings 2>/dev/null || true)
     target=$(jq -r '.target // .dest // empty' <<<"$rs" 2>/dev/null || true)
     sni=$(jq -r '.serverNames[0] // empty' <<<"$rs" 2>/dev/null || true)
-    if [[ -n "$target" ]]; then
+    if [[ "$target" == 127.0.0.1:* ]]; then
+        local sp=${target##*:} sips send sleft
+        sips=$(self_ipv4 "$sni")
+        if [[ " $sips " == *" ${SERVER_IP} "* ]]; then r_ok "Свой домен ${sni} указывает на сервер (${SERVER_IP})"
+        else r_fail "A-запись ${sni} указывает на ${sips:-ничего}, а не на ${SERVER_IP} — исправь у регистратора"; fi
+        if self_https_ok "$sni" "$sp"; then r_ok "Сайт-маскировка ${sni} (${target}): TLS с действительным сертификатом и HTTP/2"
+        else r_fail "Сайт-маскировка ${sni} на ${target} не отвечает (systemctl status nginx) — повторить: vpn reality self ${sni}"; fi
+        if [[ -s "$SELF_DIR/fullchain.pem" ]]; then
+            send=$(openssl x509 -in "$SELF_DIR/fullchain.pem" -noout -enddate 2>/dev/null | cut -d= -f2)
+            sleft=$(( ( $(date -d "$send" +%s) - $(date +%s) ) / 86400 ))
+            (( sleft > 7 )) && r_ok "Сертификат ${sni} действует ещё ${sleft} дн." \
+                || r_warn "Сертификат ${sni} истекает через ${sleft} дн. — проверь продление: ${ACME_SH} --cron --force"
+        fi
+    elif [[ -n "$target" ]]; then
         res=$(reality_probe "$target" "${sni:-${target%:*}}" 2>/dev/null || true)
         if jq -e '.obj.feasible == true' >/dev/null 2>&1 <<<"$res"; then
             r_ok "Маскировка Reality ${sni} (${target}) в порядке"
@@ -1480,6 +1617,8 @@ vpn panel                                — адрес и логин панел
 vpn check [--local]                      — полная диагностика (--local: без проверки снаружи)
 vpn trace [IP] [секунд]                  — запись подключений клиентов и разбор: дошло ли, ответил ли сервер
 vpn reality [auto|<домен>|<ip:443> <домен>] — маскировка Reality: показать / подобрать в сети хостера / задать
+vpn reality self <свой домен>            — Reality на свой домен (A-запись → этот сервер): сертификат, сайт-заглушка,
+                                           SNI = домен. Лучшая защита от блокировок по SNI
 vpn brand                                — подпись подписки и названия серверов (мастер с вопросами)
 vpn brand --show                         — показать текущие
 vpn brand [--title Т] [--announce Т] [--support @user|URL|-] [--site URL|подписка|-]
