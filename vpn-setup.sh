@@ -17,6 +17,7 @@
 #   ACME_EMAIL                 — e-mail для Let's Encrypt
 #   XHTTP_PORT=8443            — порт доп. сервера VLESS + XHTTP + Reality (0 — не создавать)
 #   HOP_PORTS=20000-50000      — включить port hopping для Hysteria2 (по умолчанию выключен)
+#   FASTEST=0                  — не создавать сервер «Самый быстрый» (по умолчанию создаётся)
 #   NO_FIREWALL=1              — не трогать ufw
 #   SKIP_EXTERNAL_CHECK=1      — не проверять порты снаружи (check-host.net)
 #   ASSUME_YES=1               — на все вопросы отвечать «да» (без интерактива)
@@ -440,7 +441,7 @@ create_inbounds() {
         --arg target "$REALITY_TARGET" --arg sni "$R_HOST" --arg host "$PUBLIC_HOST" --arg lbl "$SERVER_LABEL" '{
         remark: ($lbl + " · VLESS"), enable: true, listen: "", port: 443, protocol: "vless",
         expiryTime: 0, total: 0, shareAddrStrategy: "custom", shareAddr: $host,
-        settings: { clients: [], decryption: "none", fallbacks: [] },
+        settings: { clients: [], decryption: "none", encryption: "none", fallbacks: [] },
         streamSettings: {
           network: "tcp", security: "reality",
           tcpSettings: { acceptProxyProtocol: false, header: { type: "none" } },
@@ -847,7 +848,7 @@ do_xhttp() {
             --arg sid "$(openssl rand -hex 8)" --arg path "/$(openssl rand -hex 6)" --arg host "$PUBLIC_HOST" --arg name "$name" '{
             remark: $name, enable: true, listen: "", port: $port, protocol: "vless", expiryTime: 0, total: 0,
             shareAddrStrategy: "custom", shareAddr: $host,
-            settings: { clients: [], decryption: "none", fallbacks: [] },
+            settings: { clients: [], decryption: "none", encryption: "none", fallbacks: [] },
             streamSettings: { network: "xhttp", security: "reality",
               xhttpSettings: { path: $path, host: "", mode: "auto", xPaddingBytes: "100-1000" },
               realitySettings: { show: false, xver: 0, target: ($rs.target // $rs.dest), serverNames: $rs.serverNames,
@@ -862,6 +863,7 @@ do_xhttp() {
         env_set INBOUNDS "$(jq -c --argjson id "$id" '.[:2] + [$id]' <<<"$INBOUNDS")"
         env_set XHTTP_PORT "$port"
         if command -v ufw >/dev/null; then ufw allow "${port}/tcp" comment vless-xhttp >/dev/null 2>&1 || true; fi
+        if [[ -n "${FASTEST_ID:-}" ]]; then fastest_sync; fi
         echo "XHTTP включён: «${name}», порт ${port}/tcp, все пользователи добавлены."
         echo "Если у хостера свой фаервол — открой там ${port}/tcp. В клиентах обнови подписку."
         ;;
@@ -876,6 +878,7 @@ do_xhttp() {
         if [[ -n "${XHTTP_PORT:-}" ]] && command -v ufw >/dev/null; then ufw delete allow "${XHTTP_PORT}/tcp" >/dev/null 2>&1 || true; fi
         env_set INBOUNDS "$(jq -c '.[:2]' <<<"$INBOUNDS")"
         env_set XHTTP_PORT ""
+        if [[ -n "${FASTEST_ID:-}" ]]; then fastest_sync; fi
         echo "XHTTP выключен. В клиентах обнови подписку."
         ;;
     *)
@@ -942,6 +945,110 @@ UNIT
     *)
         if [[ -n "${HOP_PORTS:-}" ]]; then echo "Port hopping включён: UDP ${HOP_PORTS} → 443. Выключить: vpn hop off"
         else echo "Port hopping выключен. Включить: vpn hop on [диапазон, по умолчанию 20000-50000]"; fi ;;
+    esac
+}
+
+# ---------------------------------------------------------------- «Самый быстрый» (балансировщик в JSON-подписке)
+FASTEST_DEFAULT_NAME="⚡ Самый быстрый"
+FASTEST_DEFAULT_CLIENTS="happ,v2raytun"
+FASTEST_UA_PROBE="Happ/3.1.2"
+clients_regex() { # happ,v2raytun → (?i)\b(happ|v2raytun)\b
+    echo "(?i)\\b($(tr ',' '|' <<<"$1"))\\b"
+}
+restart_panel() {
+    systemctl restart x-ui
+    local i
+    for i in $(seq 1 30); do
+        if api GET /server/status 2>/dev/null | jq -e '.success == true' >/dev/null 2>&1; then return 0; fi
+        sleep 1
+    done
+    echo "Панель долго поднимается — проверь: vpn check --local"
+}
+vless_encryption_fix() { # inbound'ы без encryption ломают JSON-подписку («VLESS users: please add encryption none»)
+    local id enc
+    for id in "$(vless_id)" "$(xhttp_id)"; do
+        [[ -n "$id" ]] || continue
+        enc=$(api GET "/inbounds/get/$id" | jq -r '.obj.settings | (if type == "string" then fromjson else . end) | .encryption // ""')
+        if [[ -z "$enc" ]]; then inbound_patch "$id" '.settings.encryption = "none"'; fi
+    done
+}
+balancer_form() { # <name> → аргументы curl для create/update балансировщика
+    local id
+    printf '%s\0' --data-urlencode "remark=$1" -d strategy=leastPing -d sortOrder=1 -d enabled=true
+    for id in $(jq -r '.[]' <<<"$INBOUNDS"); do printf '%s\0' -d "inboundIds=$id"; done
+}
+fastest_sync() { # балансировщик = все текущие серверы, он первым в списке
+    local name args=() r i id
+    name=$(api GET /sub-balancers | jq -r --argjson id "$FASTEST_ID" '.obj[]? | select(.id == $id) | .remark')
+    [[ -n "$name" ]] || name=$FASTEST_DEFAULT_NAME
+    mapfile -d '' args < <(balancer_form "$name")
+    r=$(api POST "/sub-balancers/$FASTEST_ID" "${args[@]}"); ok "$r"
+    i=2
+    for id in $(jq -r '.[]' <<<"$INBOUNDS"); do
+        api_json POST "/inbounds/$id/subSortIndex" "{\"subSortIndex\": $i}" >/dev/null; i=$((i + 1))
+    done
+}
+fastest_settings() { # <on|off> <clients>
+    local all upd
+    all=$(api POST /setting/all); ok "$all"
+    if [[ $1 == on ]]; then
+        upd=$(jq --arg re "$(clients_regex "$2")" '.obj | .subJsonEnable = true | .subJsonAutoDetect = true
+            | .subJsonUserAgentRegex = $re | .subJsonAlwaysArray = true
+            | .subJsonObservatory = "{\"interval\":\"30s\",\"sampling\":2,\"timeout\":\"5s\"}"' <<<"$all")
+    else
+        upd=$(jq '.obj | .subJsonAutoDetect = false' <<<"$all")
+    fi
+    ok "$(api_json POST /setting/update "$upd")"
+}
+do_fastest() {
+    local action=${1:-} name="" clients="" a args=() r
+    [[ $# -gt 0 ]] && shift
+    while [[ $# -gt 0 ]]; do
+        a=$1; shift
+        case "$a" in
+            --name) name=${1:-}; shift ;;
+            --clients) clients=$(tr 'A-Z' 'a-z' <<<"${1:-}" | tr -d ' '); shift ;;
+            *) echo "Неизвестный параметр: $a"; exit 1 ;;
+        esac
+    done
+    if [[ -n "$clients" && ! "$clients" =~ ^[a-z0-9-]+(,[a-z0-9-]+)*$ ]]; then
+        echo "--clients: список через запятую, например happ,v2raytun,incy"; exit 1
+    fi
+    case "$action" in
+    on)
+        vless_encryption_fix
+        clients=${clients:-${FASTEST_CLIENTS:-$FASTEST_DEFAULT_CLIENTS}}
+        if [[ -z "${FASTEST_ID:-}" ]] || ! api GET /sub-balancers | jq -e --argjson id "$FASTEST_ID" '.obj[]? | select(.id == $id)' >/dev/null; then
+            mapfile -d '' args < <(balancer_form "${name:-$FASTEST_DEFAULT_NAME}")
+            r=$(api POST /sub-balancers "${args[@]}"); ok "$r"
+            env_set FASTEST_ID "$(jq -r .obj.id <<<"$r")"
+        elif [[ -n "$name" ]]; then
+            mapfile -d '' args < <(balancer_form "$name")
+            ok "$(api POST "/sub-balancers/$FASTEST_ID" "${args[@]}")"
+        fi
+        fastest_sync
+        env_set FASTEST_CLIENTS "$clients"
+        fastest_settings on "$clients"
+        echo "Перезапускаю панель (VPN моргнёт на пару секунд)…"
+        restart_panel
+        do_fastest status
+        echo "В клиентах обнови подписку: сервер появится первым в списке."
+        ;;
+    off)
+        [[ -n "${FASTEST_ID:-}" ]] || { echo "«Самый быстрый» не включён"; return; }
+        api DELETE "/sub-balancers/$FASTEST_ID" >/dev/null || true
+        fastest_settings off ""
+        env_set FASTEST_ID ""
+        restart_panel
+        echo "«Самый быстрый» выключен, все клиенты снова получают обычные ссылки. Обнови подписку в клиентах."
+        ;;
+    status|"")
+        if [[ -z "${FASTEST_ID:-}" ]]; then echo "«Самый быстрый» выключен. Включить: vpn fastest on"; return; fi
+        r=$(api GET /sub-balancers | jq -c --argjson id "$FASTEST_ID" '.obj[]? | select(.id == $id)')
+        echo "«$(jq -r .remark <<<"$r")» включён: выбирает самый быстрый из серверов ($(jq -r '.inboundIds | length' <<<"$r") шт.)"
+        echo "Получают его клиенты: ${FASTEST_CLIENTS:-$FASTEST_DEFAULT_CLIENTS} (остальные — обычные ссылки)"
+        ;;
+    *) echo "vpn fastest [on|off|status] [--name Т] [--clients happ,v2raytun,incy]"; exit 1 ;;
     esac
 }
 
@@ -1049,6 +1156,23 @@ do_brand() {
     for i in $(seq 1 20); do api GET /server/status 2>/dev/null | jq -e '.success == true' >/dev/null 2>&1 && break; sleep 1; done
     (( i < 20 )) || echo "Панель долго поднимается — проверь: vpn check --local"
     echo "Готово. В клиентах нажми «Обновить подписку»."
+}
+
+e2e_json() { # e2e_json <готовый JSON-конфиг клиента> <socks-порт> → IP выхода или пусто
+    local xray cfg logf pid out=""
+    xray=$(compgen -G '/usr/local/x-ui/bin/xray-linux-*' | head -1) || true
+    [[ -x "$xray" ]] || return 0
+    cfg=$(mktemp --suffix=.json); logf=$(mktemp)
+    jq --argjson p "$2" '.inbounds = [{"listen": "127.0.0.1", "port": $p, "protocol": "socks", "settings": {"udp": false}}]
+        | .log = {"loglevel": "warning"}' <<<"$1" > "$cfg" || { rm -f "$cfg" "$logf"; return 0; }
+    "$xray" run -c "$cfg" >"$logf" 2>&1 &
+    pid=$!
+    sleep 3
+    out=$(curl -s --max-time 15 --socks5-hostname "127.0.0.1:$2" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
+          | awk -F= '/^ip=/{print $2}') || out=""
+    kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+    rm -f "$cfg" "$logf"
+    echo "$out"
 }
 
 # ---------------------------------------------------------------- vpn check
@@ -1166,8 +1290,26 @@ do_check() {
         fi
     fi
 
+    local fj=""
+    if [[ -n "${FASTEST_ID:-}" && -n "${sub:-}" ]]; then
+        fj=$(curl -sk --max-time 15 -A "$FASTEST_UA_PROBE" "$sub" 2>/dev/null || true)
+        if jq -e 'type == "array" and (.[0].routing.balancers | length > 0)' >/dev/null 2>&1 <<<"$fj"; then
+            r_ok "JSON-подписка отдаёт «$(jq -r '.[0].remarks' <<<"$fj")» первым (серверов внутри: $(jq '[.[0].outbounds[] | select(.tag | startswith("bal-"))] | length' <<<"$fj"))"
+            if jq -e '[.[] | .outbounds[] | select(.protocol == "vless") | .settings.encryption] | all(. == "none")' >/dev/null 2>&1 <<<"$fj"; then :; else
+                r_fail "В JSON-подписке у VLESS пустой encryption — клиенты не подключатся: vpn fastest on"; fi
+        else
+            r_fail "JSON-подписка не отдаёт «Самый быстрый» (клиенты ${FASTEST_CLIENTS:-?}): vpn fastest on"
+            fj=""
+        fi
+    fi
+
     echo "— Сквозной тест (локальный клиент → сервер → интернет)"
     local ip_out
+    if [[ -n "$fj" ]]; then
+        ip_out=$(e2e_json "$(jq -c '.[0]' <<<"$fj")" 10874)
+        [[ -n "$ip_out" ]] && r_ok "«Самый быстрый» работает, выход в интернет с IP ${ip_out}" \
+            || r_fail "«Самый быстрый»: клиент не смог выйти в интернет через балансировщик"
+    fi
     if [[ -n "${xh:-}" ]]; then
         ip_out=$(e2e "$xh" 10873)
         [[ -n "$ip_out" ]] && r_ok "VLESS XHTTP работает, выход в интернет с IP ${ip_out}" \
@@ -1233,6 +1375,9 @@ vpn brand [--title Т] [--announce Т] [--support @user|URL|-] [--site URL|по�
           [--vless-name Т] [--hy2-name Т] [--xhttp-name Т] [--auto-names]   — то же флагами
 vpn xhttp on [порт] | off                — доп. сервер VLESS + XHTTP + Reality (по умолчанию порт 8443)
 vpn hop on [от-до] | off                 — port hopping для Hysteria2 (по умолчанию UDP 20000-50000)
+vpn fastest on|off|status [--name Т] [--clients happ,v2raytun,incy]
+                                         — сервер «Самый быстрый»: сам выбирает лучший протокол
+                                           (только в клиентах из списка, остальные получают обычные ссылки)
 vpn help                                 — эта справка
 Подробный гайд: https://github.com/p0sixxx/3x-ui-autodeploy/blob/main/docs/vpn-commands.md
 EOF
@@ -1246,6 +1391,7 @@ reality) load_env; do_reality "$@" ;;
 brand) load_env; do_brand "$@" ;;
 xhttp) load_env; do_xhttp "$@" ;;
 hop) load_env; do_hop "$@" ;;
+fastest) load_env; do_fastest "$@" ;;
 _hop) hop_rules "${1:-up}" "${2:-20000-50000}" ;;
 _country) country_label "${1:-}" ;;
 add)
@@ -1318,6 +1464,7 @@ finish() {
     log "Создаю твоего пользователя и проверяю всё целиком"
     if [[ "$XHTTP_PORT" != 0 ]]; then vpn xhttp on "$XHTTP_PORT" | sed 's/^/    /'; fi
     if [[ -n "${HOP_PORTS:-}" ]]; then vpn hop on "$HOP_PORTS" | sed 's/^/    /'; fi
+    if [[ "${FASTEST:-1}" != 0 ]]; then vpn fastest on | sed 's/^/    /'; fi
     vpn add me 0 0 "владелец" >/dev/null
     echo
     local rc=0
