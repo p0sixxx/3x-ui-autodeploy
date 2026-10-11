@@ -11,6 +11,9 @@
 #   REALITY_TARGET=host:443    — свой сайт-маскировка для Reality (иначе подбирается автоматически)
 #   DOMAIN=vpn.example.com     — домен с A-записью на сервер (иначе сертификат на IP)
 #   TG_BOT_TOKEN, TG_ADMIN_ID  — включить Telegram-бота 3x-ui
+#   SUB_TITLE="Мой VPN"        — название подписки в клиентах (по умолчанию VPN)
+#   SUB_ANNOUNCE="текст"       — описание под подпиской ({{EMAIL}} — имя пользователя, \n — перенос)
+#   SUPPORT_URL=@username      — кнопка «Поддержка» (ссылка или @username в Telegram)
 #   ACME_EMAIL                 — e-mail для Let's Encrypt
 #   NO_FIREWALL=1              — не трогать ufw
 #   SKIP_EXTERNAL_CHECK=1      — не проверять порты снаружи (check-host.net)
@@ -34,6 +37,7 @@ ok()   { echo -e "    ${c_g}[OK]${c_0} $*"; }
 warn() { echo -e "    ${c_y}[!!]${c_0} $*"; }
 die()  { echo -e "\n${c_r}[СТОП]${c_0} $*" >&2; exit 1; }
 rnd()  { openssl rand -hex 32 | tr -dc 'a-z0-9' | head -c "$1"; }
+norm_support() { local v=$1; [[ "$v" == @* ]] && v="https://t.me/${v#@}"; echo "$v"; }
 
 ask() { # ask "вопрос" — да/нет, по умолчанию «нет»; без терминала — «нет» (или «да» при ASSUME_YES=1)
     [[ "${ASSUME_YES:-0}" == 1 ]] && { echo "    $1 → да (ASSUME_YES)"; return 0; }
@@ -421,8 +425,8 @@ create_inbounds() {
 
     res=$(api_json POST /inbounds/add "$(jq -n \
         --arg priv "$priv" --arg pub "$pub" --arg s1 "$sid1" --arg s2 "$sid2" \
-        --arg target "$REALITY_TARGET" --arg sni "$R_HOST" --arg host "$PUBLIC_HOST" '{
-        remark: "VLESS", enable: true, listen: "", port: 443, protocol: "vless",
+        --arg target "$REALITY_TARGET" --arg sni "$R_HOST" --arg host "$PUBLIC_HOST" --arg lbl "$SERVER_LABEL" '{
+        remark: ($lbl + " · VLESS"), enable: true, listen: "", port: 443, protocol: "vless",
         expiryTime: 0, total: 0, shareAddrStrategy: "custom", shareAddr: $host,
         settings: { clients: [], decryption: "none", fallbacks: [] },
         streamSettings: {
@@ -447,8 +451,8 @@ create_inbounds() {
     fi
     res=$(api_json POST /inbounds/add "$(jq -n \
         --arg crt "$CERT" --arg key "$KEY" --arg sni "$sni" --argjson pins "$pins" \
-        --arg host "$PUBLIC_HOST" --arg mq "https://${R_HOST}" '{
-        remark: "Hysteria2", enable: true, listen: "", port: 443, protocol: "hysteria",
+        --arg host "$PUBLIC_HOST" --arg mq "https://${R_HOST}" --arg lbl "$SERVER_LABEL" '{
+        remark: ($lbl + " · Hysteria2"), enable: true, listen: "", port: 443, protocol: "hysteria",
         expiryTime: 0, total: 0, shareAddrStrategy: "custom", shareAddr: $host,
         settings: { version: 2, clients: [] },
         streamSettings: {
@@ -480,9 +484,12 @@ configure_panel() {
     SUB_BASE="${sub_scheme}://${PUBLIC_HOST}:${SUB_PORT}${SUB_PATH}"
     local upd
     upd=$(jq --argjson port "$SUB_PORT" --arg uri "$SUB_BASE" --arg mode "$CERT_MODE" \
-             --arg crt "$CERT" --arg key "$KEY" '.obj
+             --arg crt "$CERT" --arg key "$KEY" --arg title "${SUB_TITLE:-VPN}" \
+             --arg sup "$(norm_support "${SUPPORT_URL:-}")" --arg ann "${SUB_ANNOUNCE:-}" '.obj
         | .subEnable = true | .subPort = $port | .subURI = $uri
-        | .subTitle = "VPN" | .subUpdates = 6 | .timeLocation = "Europe/Moscow"
+        | .subTitle = $title | .subSupportUrl = $sup | .subAnnounce = ($ann | gsub("\\\\n"; "\n"))
+        | .subProfileMode = "builtin" | .subProfileUrl = "" | .remarkTemplate = "{{INBOUND}}"
+        | .subUpdates = 6 | .timeLocation = "Europe/Moscow"
         | if $mode == "letsencrypt" then .subCertFile = $crt | .subKeyFile = $key
           else .subCertFile = "" | .subKeyFile = "" end' <<<"$all")
     must "сохранение настроек" "$(api_json POST /setting/update "$upd")"
@@ -656,16 +663,19 @@ reality_probe() { # <target host:port> <sni>
     api POST /server/scanRealityTarget --data-urlencode "target=$1" --data-urlencode "sni=$2"
 }
 risky_sni() { [[ "${1:-}" =~ (^|\.)(cloudflare|google|googleapis|gstatic|youtube|amazon|amazonaws|microsoft|apple|icloud|akamai|fastly)\.[a-z]+$ ]]; }
+inbound_patch() { # <id> <jq-фильтр> [аргументы jq] — правит inbound целиком, клиенты остаются
+    local id=$1 f=$2 r body; shift 2
+    r=$(api GET "/inbounds/get/$id"); ok "$r"
+    body=$(jq -c "$@" ".obj
+        | .streamSettings |= (if type == \"string\" then fromjson else . end)
+        | .settings |= (if type == \"string\" then fromjson else . end)
+        | .sniffing |= (if type == \"string\" then fromjson else . end)
+        | del(.clientStats) | ${f}" <<<"$r")
+    ok "$(api_json POST "/inbounds/update/$id" "$body")"
+}
 reality_apply() { # <target host:port> <sni> — меняет target и serverNames, ключи и shortId остаются
-    local ib body
-    ib=$(reality_inbound)
-    body=$(jq -c --arg t "$1" --arg s "$2" '
-        .streamSettings |= ((if type == "string" then fromjson else . end)
-            | .realitySettings.target = $t | del(.realitySettings.dest) | .realitySettings.serverNames = [$s])
-        | .settings |= (if type == "string" then fromjson else . end)
-        | .sniffing |= (if type == "string" then fromjson else . end)
-        | del(.clientStats)' <<<"$ib")
-    ok "$(api_json POST "/inbounds/update/$(vless_id)" "$body")"
+    inbound_patch "$(vless_id)" '.streamSettings.realitySettings.target = $t | del(.streamSettings.realitySettings.dest)
+        | .streamSettings.realitySettings.serverNames = [$s]' --arg t "$1" --arg s "$2"
 }
 reality_scan() { # строки «<ip>:443 <домен> <мс>» — подходящие сайты в сети сервера, лучшие первыми
     local a b c net res out
@@ -713,6 +723,108 @@ do_reality() {
     reality_apply "$t" "$sni"
     echo "Маскировка сменена: SNI ${sni}, target ${t}."
     echo "Клиентам нужно обновить подписку (SNI в ссылке поменялся). Проверка: vpn check --local"
+}
+
+# ---------------------------------------------------------------- подпись подписки и названия серверов
+hy2_id() { jq -r '.[1]' <<<"$INBOUNDS"; }
+inbound_remark() { api GET "/inbounds/get/$1" | jq -r '.obj.remark // ""'; }
+country_label() { # [<код страны>] → «🇳🇱 Нидерланды» (без аргумента — по IP сервера)
+    local cc=${1:-}
+    if [[ -z "$cc" ]]; then
+        cc=$(curl -fsS --max-time 8 "https://ipinfo.io/${SERVER_IP}/country" 2>/dev/null | tr -dc 'A-Z' | head -c 2 || true)
+        [[ ${#cc} == 2 ]] || cc=$(curl -fsS --max-time 8 "https://ipapi.co/${SERVER_IP}/country/" 2>/dev/null | tr -dc 'A-Z' | head -c 2 || true)
+    fi
+    [[ ${#cc} == 2 ]] || { echo "Сервер"; return; }
+    python3 - "$cc" <<'PY'
+import sys
+cc = sys.argv[1].upper()
+names = {"NL": "Нидерланды", "DE": "Германия", "FI": "Финляндия", "SE": "Швеция", "FR": "Франция", "GB": "Великобритания",
+         "PL": "Польша", "LV": "Латвия", "LT": "Литва", "EE": "Эстония", "CH": "Швейцария", "AT": "Австрия", "CZ": "Чехия",
+         "IT": "Италия", "ES": "Испания", "PT": "Португалия", "BG": "Болгария", "RO": "Румыния", "MD": "Молдова",
+         "TR": "Турция", "KZ": "Казахстан", "AM": "Армения", "GE": "Грузия", "RS": "Сербия", "HU": "Венгрия",
+         "NO": "Норвегия", "DK": "Дания", "IE": "Ирландия", "BE": "Бельгия", "LU": "Люксембург", "IS": "Исландия",
+         "US": "США", "CA": "Канада", "JP": "Япония", "SG": "Сингапур", "HK": "Гонконг", "AE": "ОАЭ", "IL": "Израиль",
+         "RU": "Россия", "UA": "Украина", "BY": "Беларусь", "CY": "Кипр", "GR": "Греция", "SK": "Словакия", "SI": "Словения"}
+print("".join(chr(0x1F1E6 + ord(c) - 65) for c in cc) + " " + names.get(cc, cc))
+PY
+}
+norm_support() { # @user → https://t.me/user
+    local v=$1
+    [[ "$v" == @* ]] && v="https://t.me/${v#@}"
+    echo "$v"
+}
+prompt_keep() { # prompt_keep "вопрос" "текущее" → введённое или текущее
+    local a
+    read -r -p "$1 [${2:-пусто}]: " a </dev/tty || true
+    echo "${a:-$2}"
+}
+
+do_brand() {
+    local all title ann sup site vname hname auto=no a
+    all=$(api POST /setting/all); ok "$all"
+    title=$(jq -r '.obj.subTitle // ""' <<<"$all")
+    ann=$(jq -r '.obj.subAnnounce // ""' <<<"$all")
+    sup=$(jq -r '.obj.subSupportUrl // ""' <<<"$all")
+    site=$(jq -r 'if .obj.subProfileMode == "custom" then .obj.subProfileUrl // ""
+                  elif .obj.subProfileMode == "builtin" then "подписка" else "-" end' <<<"$all")
+    vname=$(inbound_remark "$(vless_id)"); hname=$(inbound_remark "$(hy2_id)")
+    local nflags=$#
+    while [[ $# -gt 0 ]]; do
+        a=$1; shift
+        case "$a" in
+            --title) title=${1:-}; shift ;;
+            --announce) ann=${1:-}; shift ;;
+            --support) sup=${1:-}; shift ;;
+            --site) site=${1:-}; shift ;;
+            --vless-name) vname=${1:-}; shift ;;
+            --hy2-name) hname=${1:-}; shift ;;
+            --auto-names) auto=yes ;;
+            --show) echo "Название:   ${title}"; echo "Описание:   ${ann//$'\n'/ ⏎ }"; echo "Поддержка:  ${sup:--}"
+                    echo "Сайт:       ${site}"; echo "Серверы:    ${vname} | ${hname}"; return ;;
+            *) echo "Неизвестный параметр: $a (см. vpn help)"; exit 1 ;;
+        esac
+    done
+    if [[ $auto == yes ]]; then
+        local lbl; lbl=$(country_label)
+        vname="${lbl} · VLESS"; hname="${lbl} · Hysteria2"
+    fi
+    if (( nflags == 0 )); then
+        [[ -r /dev/tty ]] || { echo "Нет терминала — задай параметры флагами (vpn help)"; exit 1; }
+        echo "Подпись подписки и названия серверов. Enter — оставить как есть."
+        echo "В описании можно писать {{EMAIL}} (имя пользователя), перенос строки — \\n."
+        title=$(prompt_keep "Название подписки" "$title")
+        ann=$(prompt_keep "Описание (announce)" "${ann//$'\n'/\\n}")
+        sup=$(prompt_keep "Поддержка (@username или ссылка, - = без кнопки)" "${sup:--}")
+        site=$(prompt_keep "Сайт (ссылка; «подписка» = страница подписки пользователя; - = без кнопки)" "$site")
+        local lbl; lbl=$(country_label)
+        [[ "$vname" == VLESS || -z "$vname" ]] && vname="${lbl} · VLESS"
+        [[ "$hname" == Hysteria2 || -z "$hname" ]] && hname="${lbl} · Hysteria2"
+        vname=$(prompt_keep "Название сервера VLESS" "$vname")
+        hname=$(prompt_keep "Название сервера Hysteria2" "$hname")
+    fi
+    ann=${ann//\\n/$'\n'}
+    [[ "$sup" == "-" ]] && sup=""
+    sup=$(norm_support "$sup")
+    (( ${#ann} <= 200 )) || echo "Внимание: описание длиннее 200 символов — некоторые клиенты его обрежут."
+    local mode url
+    case "$site" in
+        -|"") mode=none; url="" ;;
+        подписка|sub|builtin) mode=builtin; url="" ;;
+        *) mode=custom; url=$site ;;
+    esac
+    local upd
+    upd=$(jq --arg t "$title" --arg a "$ann" --arg s "$sup" --arg m "$mode" --arg u "$url" '.obj
+        | .subTitle = $t | .subAnnounce = $a | .subSupportUrl = $s | .subProfileMode = $m | .subProfileUrl = $u
+        | .remarkTemplate = "{{INBOUND}}"' <<<"$all")
+    ok "$(api_json POST /setting/update "$upd")"
+    inbound_patch "$(vless_id)" '.remark = $n' --arg n "$vname"
+    inbound_patch "$(hy2_id)" '.remark = $n' --arg n "$hname"
+    echo "Сохранено. Перезапускаю панель (VPN моргнёт на пару секунд)…"
+    systemctl restart x-ui
+    local i
+    for i in $(seq 1 20); do api GET /server/status 2>/dev/null | jq -e '.success == true' >/dev/null 2>&1 && break; sleep 1; done
+    (( i < 20 )) || echo "Панель долго поднимается — проверь: vpn check --local"
+    echo "Готово. В клиентах нажми «Обновить подписку»."
 }
 
 # ---------------------------------------------------------------- vpn check
@@ -859,6 +971,10 @@ vpn del <имя>                            — удалить
 vpn panel                                — адрес и логин панели
 vpn check [--local]                      — полная диагностика (--local: без проверки снаружи)
 vpn reality [auto|<домен>|<ip:443> <домен>] — маскировка Reality: показать / подобрать в сети хостера / задать
+vpn brand                                — подпись подписки и названия серверов (мастер с вопросами)
+vpn brand --show                         — показать текущие
+vpn brand [--title Т] [--announce Т] [--support @user|URL|-] [--site URL|подписка|-]
+          [--vless-name Т] [--hy2-name Т] [--auto-names]   — то же флагами
 EOF
 }
 
@@ -867,6 +983,8 @@ case "$cmd" in
 _probe) probe "$@" ;;
 _scan) reality_scan ;;
 reality) load_env; do_reality "$@" ;;
+brand) load_env; do_brand "$@" ;;
+_country) country_label "${1:-}" ;;
 add)
     load_env
     [[ $# -ge 3 ]] || { usage; exit 1; }
@@ -951,6 +1069,9 @@ main() {
     net_checks
     choose_params
     install_cli
+    SERVER_LABEL=$(SERVER_IP="$SERVER_IP" vpn _country 2>/dev/null || echo "Сервер")
+    [[ -n "$SERVER_LABEL" ]] || SERVER_LABEL="Сервер"
+    ok "Сервер: ${SERVER_LABEL}"
     setup_firewall
     external_precheck
     install_xui
