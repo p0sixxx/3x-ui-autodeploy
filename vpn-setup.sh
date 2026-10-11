@@ -950,7 +950,7 @@ UNIT
 
 # ---------------------------------------------------------------- «Самый быстрый» (балансировщик в JSON-подписке)
 FASTEST_DEFAULT_NAME="⚡ Самый быстрый"
-FASTEST_DEFAULT_CLIENTS="happ,v2raytun"
+FASTEST_DEFAULT_CLIENTS="happ,v2raytun,incy"
 FASTEST_UA_PROBE="Happ/3.1.2"
 clients_regex() { # happ,v2raytun → (?i)\b(happ|v2raytun)\b
     echo "(?i)\\b($(tr ',' '|' <<<"$1"))\\b"
