@@ -21,7 +21,9 @@ set -Eeuo pipefail
 trap 'echo -e "\n\033[0;31m[ОШИБКА] строка $LINENO: $BASH_COMMAND\033[0m" >&2' ERR
 
 XUI_VERSION="${XUI_VERSION:-v3.9.0}"
-REALITY_CANDIDATES="www.samsung.com:443,www.nvidia.com:443,www.amd.com:443,www.intel.com:443,www.sony.com:443,dl.google.com:443,aws.amazon.com:443,www.cloudflare.com:443"
+# запасной список, если в сети хостера ничего не нашлось; Cloudflare/Google/Amazon/Microsoft не берём —
+# их SNI на чужом IP ТСПУ режет
+REALITY_CANDIDATES="www.samsung.com:443,www.nvidia.com:443,www.amd.com:443,www.intel.com:443,www.sony.com:443"
 VPN_DIR=/etc/vpn
 XUI_BIN=/usr/local/x-ui/x-ui
 TMP_LISTENERS=()
@@ -388,6 +390,16 @@ pick_reality_target() {
         fi
         return
     fi
+    echo "    Ищу сайт в сети хостера (соседние IP), до 2 минут…"
+    local found t h l
+    found=$(API="$API" TOKEN="$TOKEN" SERVER_IP="$SERVER_IP" vpn _scan || true)
+    if [[ -n "$found" ]]; then
+        read -r t h l <<<"$(head -1 <<<"$found")"
+        REALITY_TARGET=$t; R_HOST=$h
+        ok "Выбран соседний сайт ${R_HOST} (${REALITY_TARGET}, ${l} мс)"
+        return
+    fi
+    warn "В сети хостера подходящих сайтов не нашлось — беру из запасного списка (может хуже работать из РФ)"
     res=$(api POST /server/scanRealityTargets --data-urlencode "targets=${REALITY_CANDIDATES}")
     R_HOST=$(jq -r '[.obj[]? | select(.feasible == true)][0].host // empty' <<<"$res")
     if [[ -z "$R_HOST" ]]; then
@@ -636,6 +648,73 @@ PY
     echo "$out"
 }
 
+# ---------------------------------------------------------------- маскировка Reality
+vless_id() { jq -r '.[0]' <<<"$INBOUNDS"; }
+reality_inbound() { local r; r=$(api GET "/inbounds/get/$(vless_id)"); ok "$r"; jq -c .obj <<<"$r"; }
+reality_settings() { reality_inbound | jq -c '.streamSettings | (if type == "string" then fromjson else . end) | .realitySettings'; }
+reality_probe() { # <target host:port> <sni>
+    api POST /server/scanRealityTarget --data-urlencode "target=$1" --data-urlencode "sni=$2"
+}
+risky_sni() { [[ "${1:-}" =~ (^|\.)(cloudflare|google|googleapis|gstatic|youtube|amazon|amazonaws|microsoft|apple|icloud|akamai|fastly)\.[a-z]+$ ]]; }
+reality_apply() { # <target host:port> <sni> — меняет target и serverNames, ключи и shortId остаются
+    local ib body
+    ib=$(reality_inbound)
+    body=$(jq -c --arg t "$1" --arg s "$2" '
+        .streamSettings |= ((if type == "string" then fromjson else . end)
+            | .realitySettings.target = $t | del(.realitySettings.dest) | .realitySettings.serverNames = [$s])
+        | .settings |= (if type == "string" then fromjson else . end)
+        | .sniffing |= (if type == "string" then fromjson else . end)
+        | del(.clientStats)' <<<"$ib")
+    ok "$(api_json POST "/inbounds/update/$(vless_id)" "$body")"
+}
+reality_scan() { # строки «<ip>:443 <домен> <мс>» — подходящие сайты в сети сервера, лучшие первыми
+    local a b c net res out
+    IFS=. read -r a b c _ <<<"$SERVER_IP"
+    [[ -n "$c" ]] || return 1
+    for net in "$a.$b.$c.0/24" "$a.$b.$(( c > 0 ? c - 1 : 1 )).0/24" "$a.$b.$(( c < 255 ? c + 1 : 254 )).0/24"; do
+        res=$(api POST /server/scanRealityTargets --max-time 300 --data-urlencode "targets=$net" 2>/dev/null || true)
+        out=$(jq -r --arg me "$SERVER_IP" '.obj[]? | select(.feasible == true and .ip != $me and (.host // "") != "")
+                 | "\(.ip):\(.port) \(.host) \(.latencyMs)"' <<<"$res" 2>/dev/null | while read -r t h l; do
+                 risky_sni "$h" || echo "$t $h $l"; done)
+        [[ -n "$out" ]] && { echo "$out"; return 0; }
+    done
+    return 1
+}
+
+do_reality() {
+    local force=no args=() a
+    for a in "$@"; do [[ "$a" == --force ]] && force=yes || args+=("$a"); done
+    set -- "${args[@]+"${args[@]}"}"
+    local rs t sni found l res
+    if [[ $# -eq 0 ]]; then
+        rs=$(reality_settings)
+        echo "Сейчас: SNI $(jq -r '.serverNames | join(",")' <<<"$rs"), target $(jq -r '.target // .dest' <<<"$rs")"
+        echo "Сменить: vpn reality auto | vpn reality <домен> | vpn reality <ip:443> <домен>"
+        return
+    fi
+    if [[ "$1" == auto ]]; then
+        echo "Ищу сайты с TLS 1.3 + h2 + X25519 в сети сервера (${SERVER_IP%.*}.0/24 и соседние), до 2–3 минут…"
+        found=$(reality_scan || true)
+        [[ -n "$found" ]] || { echo "Подходящих сайтов в сети хостера не нашлось. Укажи домен вручную: vpn reality <домен>"; exit 1; }
+        echo "Найдено (лучшие):"
+        head -5 <<<"$found" | while read -r t sni l; do echo "  ${sni}  (${t}, ${l} мс)"; done
+        read -r t sni l <<<"$(head -1 <<<"$found")"
+    else
+        t=$1; [[ "$t" == *:* ]] || t="$t:443"
+        sni=${2:-${t%:*}}
+        if [[ "$sni" =~ ^[0-9.]+$ ]]; then echo "Для IP укажи домен (SNI) вторым аргументом: vpn reality $t <домен>"; exit 1; fi
+        res=$(reality_probe "$t" "$sni")
+        if ! jq -e '.obj.feasible == true' >/dev/null 2>&1 <<<"$res"; then
+            echo "${sni} (${t}) не подходит для Reality: $(jq -r '.obj.reason // .msg // "?"' <<<"$res" 2>/dev/null)"
+            [[ $force == yes ]] || { echo "Применить всё равно: добавь --force"; exit 1; }
+        fi
+        risky_sni "$sni" && echo "Внимание: ${sni} — крупный CDN, на чужом IP его часто блокируют в РФ."
+    fi
+    reality_apply "$t" "$sni"
+    echo "Маскировка сменена: SNI ${sni}, target ${t}."
+    echo "Клиентам нужно обновить подписку (SNI в ссылке поменялся). Проверка: vpn check --local"
+}
+
 # ---------------------------------------------------------------- vpn check
 N_OK=0; N_WARN=0; N_FAIL=0
 r_ok()   { echo -e "  ${c_g}[OK]${c_0}   $*"; N_OK=$((N_OK + 1)); }
@@ -714,13 +793,20 @@ do_check() {
     else
         r_fail "Не удалось получить служебного пользователя ${HC_USER}"
     fi
-    local target res
-    target=$(api GET /inbounds/list 2>/dev/null | jq -r '.obj[]? | select(.protocol == "vless") | .streamSettings
-        | (if type == "string" then fromjson else . end) | .realitySettings | (.target // .dest)' 2>/dev/null | head -1 || true)
+    local rs target sni res
+    rs=$(reality_settings 2>/dev/null || true)
+    target=$(jq -r '.target // .dest // empty' <<<"$rs" 2>/dev/null || true)
+    sni=$(jq -r '.serverNames[0] // empty' <<<"$rs" 2>/dev/null || true)
     if [[ -n "$target" ]]; then
-        res=$(api POST /server/scanRealityTarget --data-urlencode "target=${target}" 2>/dev/null || true)
-        jq -e '.obj.feasible == true' >/dev/null 2>&1 <<<"$res" && r_ok "Маскировка Reality ${target} в порядке" \
-            || r_fail "Маскировка Reality ${target} не проходит проверку: $(jq -r '.obj.reason // "?"' <<<"$res" 2>/dev/null) — смени Target/SNI в панели"
+        res=$(reality_probe "$target" "${sni:-${target%:*}}" 2>/dev/null || true)
+        if jq -e '.obj.feasible == true' >/dev/null 2>&1 <<<"$res"; then
+            r_ok "Маскировка Reality ${sni} (${target}) в порядке"
+        else
+            r_fail "Маскировка Reality ${sni} (${target}) не проходит проверку: $(jq -r '.obj.reason // "?"' <<<"$res" 2>/dev/null) — исправить: vpn reality auto"
+        fi
+        if risky_sni "$sni"; then
+            r_warn "SNI ${sni} принадлежит крупному CDN — на чужом IP его часто блокируют в РФ. Лучше сайт из сети хостера: vpn reality auto"
+        fi
     fi
 
     echo "— Сквозной тест (локальный клиент → сервер → интернет)"
@@ -772,12 +858,15 @@ vpn off|on <имя>                         — отключить / включ�
 vpn del <имя>                            — удалить
 vpn panel                                — адрес и логин панели
 vpn check [--local]                      — полная диагностика (--local: без проверки снаружи)
+vpn reality [auto|<домен>|<ip:443> <домен>] — маскировка Reality: показать / подобрать в сети хостера / задать
 EOF
 }
 
 cmd=${1:-help}; shift || true
 case "$cmd" in
 _probe) probe "$@" ;;
+_scan) reality_scan ;;
+reality) load_env; do_reality "$@" ;;
 add)
     load_env
     [[ $# -ge 3 ]] || { usage; exit 1; }
@@ -874,4 +963,10 @@ main() {
     finish
 }
 
-[[ "${VPN_SETUP_LIB:-0}" == 1 ]] || main "$@"
+if [[ "${VPN_SETUP_LIB:-0}" != 1 ]]; then
+    if [[ "${1:-}" == --cli ]]; then   # только обновить утилиту vpn, сервер не трогать
+        [[ $EUID -eq 0 ]] || die "Запусти от root"
+        install_cli; ok "Утилита vpn обновлена"; exit 0
+    fi
+    main "$@"
+fi
