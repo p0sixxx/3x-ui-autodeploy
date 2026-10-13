@@ -193,6 +193,7 @@ vpn brand --title "p0six KVN" --announce 'Привет, {{EMAIL}}\nОплата 
           --support @admin --site подписка
 
 vpn brand --vless-name "FIN - VLESS TCP" --xhttp-name "FIN - VLESS XHTTP" --hy2-name "FIN - Hysteria2"
+vpn brand --http3-name "FIN - VLESS HTTP3"     # если включён сервер HTTP3
 ```
 
 Флаги можно указывать в любом наборе: остальные значения не меняются. После `vpn brand` панель перезапускается, VPN пропадает на пару секунд. Затем в клиентах нужно нажать «Обновить подписку».
@@ -251,17 +252,18 @@ vpn hop off
 - Если у хостера свой фаервол, откройте в нём порт XHTTP (8443/tcp) и, для hopping, UDP 20000–50000.
 - После включения или выключения обновите подписку в клиентах. `vpn check` проверяет оба режима: порт, правило iptables, ссылку в подписке и сквозной тест XHTTP.
 
-### XHTTP по HTTP/3: `vpn http3` (когда глушат TCP)
+### Сервер HTTP3: `vpn http3` (когда глушат TCP)
 
-Если `vpn trace` показывает, что TCP-подключения к серверу пропадают после первого пакета, а Hysteria2 (UDP) работает, добавь второй UDP-путь: VLESS + XHTTP поверх **HTTP/3 (QUIC)** с настоящим TLS на твоём домене.
+Если `vpn trace` показывает, что TCP-подключения к серверу пропадают после первого пакета, а Hysteria2 (UDP) работает, добавь второй UDP-путь: сервер **HTTP3**. Это VLESS + XHTTP поверх HTTP/3 (QUIC) с настоящим TLS на твоём домене.
 
 ```
-vpn reality self cdn.домен.tech   # один раз: свой домен и сертификат
-vpn http3 on                         # 4443/udp; vpn http3 on <порт> --name "🇫🇮 VLESS HTTP3"
-vpn http3 off
+vpn reality self cdn.домен.tech                 # один раз: свой домен и сертификат
+vpn http3 on 4443 --name "🇫🇮 VLESS HTTP3"      # включить (порт и название можно не указывать)
+vpn http3                                       # статус
+vpn http3 off                                   # выключить
 ```
 
-Сервер появится в подписке и в «⚡ Самом быстром». Его видят клиенты на Xray (INCY, Happ, v2RayTun), sing-box не поддерживает XHTTP. Если у хостера свой фаервол, открой там UDP-порт. Подробнее — в [гайде](docs/vpn-commands.md#vpn-http3--сервер-vless-xhttp-по-http3-quic-udp).
+Сервер появится в подписке и в «⚡ Самом быстром». Его видят клиенты на Xray (INCY, Happ, v2RayTun), sing-box XHTTP не поддерживает. Если у хостера свой фаервол, открой там UDP-порт. Подробнее — в [гайде](docs/vpn-commands.md#vpn-http3--сервер-http3-vless-xhttp-по-http3-quicudp).
 
 ## 9а. Сервер «Самый быстрый»
 
@@ -301,7 +303,7 @@ vpn fastest off                               # выключить
 | `vpn reality [auto\|<домен>\|<ip:443> <домен>]` | маскировка Reality |
 | `vpn reality self <свой домен>` | Reality на свой домен: сертификат, сайт-заглушка, SNI = домен |
 | `vpn xhttp on [порт] \| off` | сервер VLESS XHTTP |
-| `vpn http3 on [порт] \| off` | сервер VLESS XHTTP по HTTP/3 (QUIC, UDP) на своём домене |
+| `vpn http3 on [порт] [--name Т] \| off` | сервер HTTP3: VLESS XHTTP по HTTP/3 (QUIC, UDP) на своём домене |
 | `vpn hop on [от-до] \| off` | port hopping для Hysteria2 |
 | `vpn fastest [on\|off\|status] [--name Т] [--clients …]` | сервер «⚡ Самый быстрый» |
 | `vpn check [--local]` | полная диагностика (`--local` — без проверки снаружи) |

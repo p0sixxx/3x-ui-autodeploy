@@ -1055,7 +1055,7 @@ h3_default_name() {
     if [[ -n "$(xhttp_id)" ]]; then x=$(inbound_remark "$(xhttp_id)"); echo "${x} HTTP3"; return; fi
     x=$(inbound_remark "$(vless_id)"); echo "${x% · VLESS} · HTTP3"
 }
-do_h3() {
+do_http3() {
     local action=${1:-status}; [[ $# -gt 0 ]] && shift
     case "$action" in
     on)
@@ -1347,7 +1347,7 @@ do_brand() {
             --vless-name) vname=${1:-}; shift ;;
             --hy2-name) hname=${1:-}; shift ;;
             --xhttp-name) xname=${1:-}; shift ;;
-            --http3-name|--h3-name) h3name=${1:-}; shift ;;
+            --http3-name) h3name=${1:-}; shift ;;
             --auto-names) auto=yes ;;
             --show) echo "Название:   ${title}"; echo "Описание:   ${ann//$'\n'/ ⏎ }"; echo "Поддержка:  ${sup:--}"
                     echo "Сайт:       ${site}"; echo "Серверы:    ${vname} | ${hname}${xname:+ | ${xname}}${h3name:+ | ${h3name}}"; return ;;
@@ -1778,7 +1778,7 @@ xhttp) load_env; do_xhttp "$@" ;;
 hop) load_env; do_hop "$@" ;;
 fastest) load_env; do_fastest "$@" ;;
 trace) load_env; do_trace "$@" ;;
-http3|h3) load_env; do_h3 "$@" ;;
+http3) load_env; do_http3 "$@" ;;
 _hop) hop_rules "${1:-up}" "${2:-20000-50000}" ;;
 _country) country_label "${1:-}" ;;
 add)
