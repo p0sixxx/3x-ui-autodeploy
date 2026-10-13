@@ -909,7 +909,15 @@ NGX
     systemctl enable nginx >/dev/null 2>&1 || true
     systemctl restart nginx >/dev/null 2>&1 || { echo "nginx не запустился: journalctl -u nginx -n 30"; exit 1; }
 }
-self_cert() { # <домен> — выпуск через 80/tcp (standalone), автопродление через cron acme.sh
+self_reload() { # команда после выпуска/продления сертификата Reality-домена
+    local c="systemctl reload nginx"
+    # серверу подписок нужен рестарт, он читает сертификат только при старте
+    if [[ "${SUB_CERT:-}" == "$SELF_DIR/fullchain.pem" ]]; then c="$c; systemctl restart x-ui"; fi
+    echo "$c"
+}
+self_cert() { # <домен> [каталог] [команда-после] — выпуск через 80/tcp (standalone), автопродление через cron acme.sh
+    local dir=${2:-$SELF_DIR} reload=${3:-}
+    [[ -n "$reload" ]] || reload=$(self_reload)
     if [[ ! -x "$ACME_SH" ]]; then
         echo "  Ставлю acme.sh…"
         curl -fsSL https://get.acme.sh | sh -s email="admin@$1" >/dev/null 2>&1 || true
@@ -919,7 +927,7 @@ self_cert() { # <домен> — выпуск через 80/tcp (standalone), а
         echo "Порт 80/tcp занят ($(ss -Hltnp 'sport = :80' 2>/dev/null | grep -o 'users:(("[^"]*' | cut -d'"' -f2 | head -1)) — Let's Encrypt не сможет проверить домен. Освободи его и повтори."
         exit 1
     fi
-    mkdir -p "$SELF_DIR"; chmod 700 "$SELF_DIR"
+    mkdir -p "$dir"; chmod 700 "$dir"
     echo "  Получаю сертификат Let's Encrypt для $1 (через 80/tcp)…"
     local rc=0 log=/var/log/vpn-self-acme.log
     "$ACME_SH" --issue -d "$1" --standalone --httpport 80 --server letsencrypt --keylength ec-256 >"$log" 2>&1 || rc=$?
@@ -929,9 +937,9 @@ self_cert() { # <домен> — выпуск через 80/tcp (standalone), а
         echo "Let's Encrypt не выдал сертификат (лог: $log). Проверь A-запись домена и что 80/tcp открыт у хостера."
         exit 1
     fi
-    "$ACME_SH" --install-cert -d "$1" --ecc --key-file "$SELF_DIR/key.pem" --fullchain-file "$SELF_DIR/fullchain.pem" \
-        --reloadcmd "systemctl reload nginx" >>"$log" 2>&1 || { tail -5 "$log"; echo "Не удалось установить сертификат (лог: $log)"; exit 1; }
-    chmod 600 "$SELF_DIR/key.pem"
+    "$ACME_SH" --install-cert -d "$1" --ecc --key-file "$dir/key.pem" --fullchain-file "$dir/fullchain.pem" \
+        --reloadcmd "$reload" >>"$log" 2>&1 || { tail -5 "$log"; echo "Не удалось установить сертификат (лог: $log)"; exit 1; }
+    chmod 600 "$dir/key.pem"
 }
 do_reality_self() { # <домен>
     local d=${1,,} ips v6 port
@@ -964,6 +972,87 @@ do_reality_self() { # <домен>
     env_set SELF_DOMAIN "$d"; env_set SELF_PORT "$port"
     echo "Готово: SNI $d, маскировка — свой сайт (127.0.0.1:$port). Сертификат продлевается сам (cron acme.sh)."
     echo "Клиентам нужно обновить подписку. Проверка: vpn check --local"
+}
+
+# ---------------------------------------------------------------- ссылка подписки на своём домене
+SUB_DIR=/etc/vpn/sub
+sub_apply() { # <subURI> <cert> <key> — записать в панель и перезапустить
+    local all upd
+    all=$(api POST /setting/all); ok "$all"
+    upd=$(jq --arg uri "$1" --arg crt "$2" --arg key "$3" '.obj | .subURI = $uri | .subCertFile = $crt | .subKeyFile = $key' <<<"$all")
+    ok "$(api_json POST /setting/update "$upd")"
+    restart_panel
+}
+sub_tls_ok() { # <домен> — сервер подписок отвечает по HTTPS с проверкой сертификата
+    local i
+    for i in 1 2 3 4 5; do
+        curl -s --noproxy '*' -o /dev/null --max-time 8 "https://$1:${SUB_PORT}/" 2>/dev/null && return 0
+        sleep 1
+    done
+    return 1
+}
+do_subdomain() { # on <домен> | off | status
+    node_guard
+    local act=${1:-status} all path
+    all=$(api POST /setting/all); ok "$all"; path=$(jq -r .obj.subPath <<<"$all")
+    case "$act" in
+    status)
+        echo "Ссылка подписки: ${SUB_BASE}<ID>"
+        if [[ -n "${SUB_DOMAIN:-}" ]]; then
+            echo "Домен подписки: ${SUB_DOMAIN}, сертификат до $(openssl x509 -in "$SUB_CERT" -noout -enddate 2>/dev/null | cut -d= -f2)"
+        else
+            echo "Домен подписки не задан — ссылки идут на ${PUBLIC_HOST}. Включить: vpn sub-domain <домен>"
+        fi
+        ;;
+    off)
+        [[ -n "${SUB_DOMAIN:-}" ]] || { echo "Домен подписки и так не задан"; return; }
+        local sch=http crt="" key=""
+        if [[ "$CERT_MODE" == letsencrypt ]]; then sch=https; crt=${SUB_CERT_ORIG:-$CERT}; key=${SUB_KEY_ORIG:-$(dirname "$CERT")/privkey.pem}; fi
+        sub_apply "${sch}://${PUBLIC_HOST}:${SUB_PORT}${path}" "$crt" "$key"
+        env_set SUB_BASE "${sch}://${PUBLIC_HOST}:${SUB_PORT}${path}"
+        env_set SUB_DOMAIN ""; env_set SUB_CERT ""; env_set SUB_KEY ""
+        echo "Подписки снова на ${PUBLIC_HOST}. В клиентах добавь подписку заново: vpn link <имя>"
+        ;;
+    *)
+        local d=${act,,} ips crt key old_uri old_crt old_key
+        [[ "$d" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$ ]] || { echo "Использование: vpn sub-domain <домен> | off | status"; exit 1; }
+        ips=$(self_ipv4 "$d")
+        [[ -n "$ips" ]] || { echo "У $d нет A-записи. Создай A-запись $d → ${SERVER_IP} и подожди 5–15 минут."; exit 1; }
+        [[ " $ips " == *" ${SERVER_IP} "* ]] || { echo "A-запись $d указывает на ${ips}, а не на этот сервер (${SERVER_IP})."; exit 1; }
+        echo "Подписка на домене: $d"
+        echo "  DNS: $d → ${SERVER_IP}"
+        if [[ "$d" == "${SELF_DOMAIN:-}" && -r "$SELF_DIR/fullchain.pem" && -r "$SELF_DIR/key.pem" ]]; then
+            crt=$SELF_DIR/fullchain.pem; key=$SELF_DIR/key.pem
+            echo "  Сертификат: тот же, что у Reality ($SELF_DIR)"
+        else
+            crt=$SUB_DIR/fullchain.pem; key=$SUB_DIR/key.pem
+            self_cert "$d" "$SUB_DIR" "systemctl restart x-ui"
+        fi
+        openssl x509 -in "$crt" -noout -checkhost "$d" 2>/dev/null | grep -q 'does match' \
+            || { echo "Сертификат $crt не выпущен на $d"; exit 1; }
+        old_uri=$(jq -r .obj.subURI <<<"$all"); old_crt=$(jq -r .obj.subCertFile <<<"$all"); old_key=$(jq -r .obj.subKeyFile <<<"$all")
+        if [[ -z "${SUB_DOMAIN:-}" ]]; then env_set SUB_CERT_ORIG "$old_crt"; env_set SUB_KEY_ORIG "$old_key"; fi
+        # сертификат Reality-домена продлевается с рестартом панели — обновим команду в acme.sh
+        env_set SUB_CERT "$crt"; env_set SUB_KEY "$key"
+        if [[ "$crt" == "$SELF_DIR/fullchain.pem" && -x "$ACME_SH" ]]; then
+            "$ACME_SH" --install-cert -d "$d" --ecc --key-file "$key" --fullchain-file "$crt" --reloadcmd "$(self_reload)" >/dev/null 2>&1 || true
+        fi
+        echo "  Перезапускаю панель (VPN моргнёт на пару секунд)…"
+        sub_apply "https://${d}:${SUB_PORT}${path}" "$crt" "$key"
+        if ! sub_tls_ok "$d"; then
+            echo "Сервер подписок не отвечает по https://$d:${SUB_PORT} — возвращаю прежние настройки."
+            sub_apply "$old_uri" "$old_crt" "$old_key"
+            env_set SUB_CERT ""; env_set SUB_KEY ""
+            echo "Проверь, что порт ${SUB_PORT}/tcp открыт (у хостера тоже): journalctl -u x-ui -n 30"
+            exit 1
+        fi
+        env_set SUB_DOMAIN "$d"
+        env_set SUB_BASE "https://${d}:${SUB_PORT}${path}"
+        echo "Готово: подписки теперь https://${d}:${SUB_PORT}${path}<ID>"
+        echo "Ссылки на старый адрес (IP) работать не будут — у каждого пользователя новую покажет vpn link <имя>."
+        echo "Подписка у клиентов с новым адресом добавляется заново (ID пользователя тот же)."
+        ;;
+    esac
 }
 
 # ---------------------------------------------------------------- XHTTP и port hopping
@@ -1491,10 +1580,16 @@ do_check() {
         (( left > 24 )) && r_ok "Сертификат Let's Encrypt действует ещё $(( left / 24 )) дн. $(( left % 24 )) ч" \
             || r_warn "Сертификат истекает через ${left} ч — проверь продление: ~/.acme.sh/acme.sh --cron --force"
         crontab -l 2>/dev/null | grep -q acme.sh && r_ok "Автопродление (cron acme.sh) есть" || r_fail "Нет cron acme.sh — сертификат не будет продлеваться"
-        if curl -s -o /dev/null --max-time 10 "https://${PUBLIC_HOST}:${SUB_PORT}/" 2>/dev/null; then
-            r_ok "TLS подписок проходит проверку сертификата"
+        if [[ -n "${SUB_DOMAIN:-}" ]]; then
+            local sleft
+            sleft=$(( ( $(date -d "$(openssl x509 -in "$SUB_CERT" -noout -enddate 2>/dev/null | cut -d= -f2)" +%s 2>/dev/null || echo 0) - $(date +%s) ) / 86400 ))
+            (( sleft > 7 )) && r_ok "Сертификат домена подписки ${SUB_DOMAIN}: ещё ${sleft} дн." \
+                || r_warn "Сертификат домена подписки ${SUB_DOMAIN}: осталось ${sleft} дн. — проверь продление (~/.acme.sh/acme.sh --cron --force)"
+        fi
+        if curl -s -o /dev/null --max-time 10 "https://${SUB_DOMAIN:-$PUBLIC_HOST}:${SUB_PORT}/" 2>/dev/null; then
+            r_ok "TLS подписок проходит проверку сертификата (${SUB_DOMAIN:-$PUBLIC_HOST})"
         else
-            r_fail "TLS-проверка сертификата на ${PUBLIC_HOST}:${SUB_PORT} не прошла"
+            r_fail "TLS-проверка сертификата на ${SUB_DOMAIN:-$PUBLIC_HOST}:${SUB_PORT} не прошла"
         fi
     else
         r_warn "Самоподписанный сертификат: панель с предупреждением браузера, подписки по http"
@@ -1944,6 +2039,8 @@ vpn trace [IP] [секунд]                  — запись подключе
 vpn reality [auto|<домен>|<ip:443> <домен>] — маскировка Reality: показать / подобрать в сети хостера / задать
 vpn reality self <свой домен>            — Reality на свой домен (A-запись → этот сервер): сертификат, сайт-заглушка,
                                            SNI = домен. Лучшая защита от блокировок по SNI
+vpn sub-domain <домен> | off | status    — ссылка подписки на своём домене вместо IP (A-запись → этот сервер,
+                                           сертификат Let's Encrypt; Reality-домен переиспользуется)
 vpn brand                                — подпись подписки и названия серверов (мастер с вопросами)
 vpn brand --show                         — показать текущие
 vpn brand [--title Т] [--announce Т] [--support @user|URL|-] [--site URL|подписка|-]
@@ -1965,6 +2062,7 @@ case "$cmd" in
 _probe) probe "$@" ;;
 _scan) reality_scan ;;
 reality) load_env; do_reality "$@" ;;
+sub-domain|subdomain) load_env; do_subdomain "$@" ;;
 brand) load_env; do_brand "$@" ;;
 xhttp) load_env; do_xhttp "$@" ;;
 hop) load_env; do_hop "$@" ;;
