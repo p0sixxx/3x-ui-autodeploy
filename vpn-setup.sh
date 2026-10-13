@@ -723,9 +723,14 @@ p = u.urlparse(link); q = dict(u.parse_qsl(p.query))
 host, port, user = p.hostname, p.port or 443, u.unquote(p.username or "")
 if p.scheme == "vless":
     net = q.get("type", "tcp")
-    ss = {"network": net, "security": "reality",
-          "realitySettings": {"serverName": q.get("sni", ""), "fingerprint": q.get("fp") or "chrome",
-                              "publicKey": q["pbk"], "shortId": q.get("sid", ""), "spiderX": "/"}}
+    if q.get("security") == "tls":
+        ss = {"network": net, "security": "tls",
+              "tlsSettings": {"serverName": q.get("sni") or host, "fingerprint": q.get("fp") or "chrome",
+                              "alpn": [a for a in q.get("alpn", "").split(",") if a] or ["h2", "http/1.1"]}}
+    else:
+        ss = {"network": net, "security": "reality",
+              "realitySettings": {"serverName": q.get("sni", ""), "fingerprint": q.get("fp") or "chrome",
+                                  "publicKey": q["pbk"], "shortId": q.get("sid", ""), "spiderX": "/"}}
     if net == "xhttp":
         ss["xhttpSettings"] = {"path": q.get("path", "/"), "host": q.get("host", ""), "mode": q.get("mode", "auto")}
     ob = {"protocol": "vless",
@@ -953,13 +958,20 @@ do_reality_self() { # <домен>
     self_https_ok "$d" "$port" || { echo "Сайт-маскировка на 127.0.0.1:$port не отвечает по TLS 1.3 + HTTP/2 с проверкой сертификата (journalctl -u nginx)"; exit 1; }
     echo "  Сайт-маскировка: https://$d (127.0.0.1:$port), сертификат до $(openssl x509 -in "$SELF_DIR/fullchain.pem" -noout -enddate | cut -d= -f2)"
     reality_apply "127.0.0.1:$port" "$d"
+    if [[ -n "$(h3_id)" ]]; then inbound_patch "$(h3_id)" '.streamSettings.tlsSettings.serverName = $d' --arg d "$d"; fi
     env_set SELF_DOMAIN "$d"; env_set SELF_PORT "$port"
     echo "Готово: SNI $d, маскировка — свой сайт (127.0.0.1:$port). Сертификат продлевается сам (cron acme.sh)."
     echo "Клиентам нужно обновить подписку. Проверка: vpn check --local"
 }
 
 # ---------------------------------------------------------------- XHTTP и port hopping
-xhttp_id() { jq -r '.[2] // empty' <<<"$INBOUNDS"; }
+xhttp_id() { # XHTTP_ID; у старых установок — третий элемент INBOUNDS
+    if [[ -n "${XHTTP_ID:-}" ]]; then echo "$XHTTP_ID"
+    elif [[ -n "${XHTTP_PORT:-}" ]]; then jq -r '.[2] // empty' <<<"$INBOUNDS"; fi
+}
+h3_id() { echo "${H3_ID:-}"; }
+inbounds_add() { env_set INBOUNDS "$(jq -c --argjson id "$1" 'if any(.[]; . == $id) then . else . + [$id] end' <<<"$INBOUNDS")"; }
+inbounds_del() { env_set INBOUNDS "$(jq -c --argjson id "$1" 'map(select(. != $id))' <<<"$INBOUNDS")"; }
 env_set() { # env_set KEY VALUE — записать в /etc/vpn/vpn.env
     if grep -q "^$1=" "$ENV_FILE"; then sed -i "s|^$1=.*|$1='$2'|" "$ENV_FILE"; else echo "$1='$2'" >> "$ENV_FILE"; fi
     printf -v "$1" '%s' "$2"
@@ -992,8 +1004,8 @@ do_xhttp() {
         if [[ "$emails" != "[]" ]]; then
             ok "$(api_json POST /clients/bulkAttach "$(jq -nc --argjson e "$emails" --argjson i "[$id]" '{emails: $e, inboundIds: $i}')")"
         fi
-        env_set INBOUNDS "$(jq -c --argjson id "$id" '.[:2] + [$id]' <<<"$INBOUNDS")"
-        env_set XHTTP_PORT "$port"
+        inbounds_add "$id"
+        env_set XHTTP_ID "$id"; env_set XHTTP_PORT "$port"
         if command -v ufw >/dev/null; then ufw allow "${port}/tcp" comment vless-xhttp >/dev/null 2>&1 || true; fi
         if [[ -n "${FASTEST_ID:-}" ]]; then fastest_sync; fi
         echo "XHTTP включён: «${name}», порт ${port}/tcp, все пользователи добавлены."
@@ -1008,14 +1020,109 @@ do_xhttp() {
         fi
         ok "$(api POST "/inbounds/del/$id")"
         if [[ -n "${XHTTP_PORT:-}" ]] && command -v ufw >/dev/null; then ufw delete allow "${XHTTP_PORT}/tcp" >/dev/null 2>&1 || true; fi
-        env_set INBOUNDS "$(jq -c '.[:2]' <<<"$INBOUNDS")"
-        env_set XHTTP_PORT ""
+        inbounds_del "$id"
+        env_set XHTTP_ID ""; env_set XHTTP_PORT ""
         if [[ -n "${FASTEST_ID:-}" ]]; then fastest_sync; fi
         echo "XHTTP выключен. В клиентах обнови подписку."
         ;;
     *)
         if [[ -n "$(xhttp_id)" ]]; then echo "XHTTP включён: порт ${XHTTP_PORT}/tcp. Выключить: vpn xhttp off"
         else echo "XHTTP выключен. Включить: vpn xhttp on [порт, по умолчанию 8443]"; fi ;;
+    esac
+}
+
+# ---------------------------------------------------------------- XHTTP поверх HTTP/3 (QUIC, UDP)
+# VLESS + XHTTP + TLS (alpn h3) на своём домене: QUIC/UDP с настоящим сертификатом Let's Encrypt.
+# Нужен свой домен (vpn reality self). Xray сам перечитывает сертификат после продления (ocspStapling).
+h3_inbound_json() { # <порт> <домен> <путь> <название>
+    jq -n --argjson port "$1" --arg d "$2" --arg path "$3" --arg name "$4" --arg host "$PUBLIC_HOST" \
+        --arg cf "$SELF_DIR/fullchain.pem" --arg kf "$SELF_DIR/key.pem" '{
+        remark: $name, enable: true, listen: "", port: $port, protocol: "vless", expiryTime: 0, total: 0,
+        shareAddrStrategy: "custom", shareAddr: $host,
+        settings: { clients: [], decryption: "none", encryption: "none", fallbacks: [] },
+        streamSettings: { network: "xhttp", security: "tls",
+          xhttpSettings: { path: $path, host: "", mode: "auto", xPaddingBytes: "100-1000" },
+          tlsSettings: { serverName: $d, minVersion: "1.3", maxVersion: "1.3", cipherSuites: "", rejectUnknownSni: false,
+            disableSystemRoot: false, enableSessionResumption: false, alpn: ["h3"],
+            certificates: [{ certificateFile: $cf, keyFile: $kf, ocspStapling: 3600, oneTimeLoading: false,
+                             usage: "encipherment", buildChain: false }],
+            echServerKeys: "", echForceQuery: "none",
+            settings: { allowInsecure: false, fingerprint: "chrome", echConfigList: "" } } },
+        sniffing: { enabled: true, destOverride: ["http", "tls", "quic"], metadataOnly: false, routeOnly: true } }'
+}
+h3_default_name() {
+    local x
+    if [[ -n "$(xhttp_id)" ]]; then x=$(inbound_remark "$(xhttp_id)"); echo "${x} H3"; return; fi
+    x=$(inbound_remark "$(vless_id)"); echo "${x% · VLESS} · XHTTP H3"
+}
+do_h3() {
+    local action=${1:-status}; [[ $# -gt 0 ]] && shift
+    case "$action" in
+    on)
+        if [[ -n "$(h3_id)" ]]; then echo "XHTTP/3 уже включён (порт ${H3_PORT}/udp)"; return; fi
+        local port=4443 name="" a
+        while [[ $# -gt 0 ]]; do
+            a=$1; shift
+            case "$a" in
+                --name) name=${1:-}; shift ;;
+                *) port=$a ;;
+            esac
+        done
+        [[ "$port" =~ ^[0-9]+$ ]] && (( port > 0 && port < 65536 )) || { echo "Порт — число 1–65535"; exit 1; }
+        if [[ -z "${SELF_DOMAIN:-}" || ! -s "$SELF_DIR/fullchain.pem" || ! -s "$SELF_DIR/key.pem" ]]; then
+            echo "XHTTP/3 работает на своём домене с настоящим сертификатом. Сначала: vpn reality self <домен>"; exit 1
+        fi
+        if ! openssl x509 -in "$SELF_DIR/fullchain.pem" -noout -checkend 86400 >/dev/null 2>&1; then
+            echo "Сертификат ${SELF_DOMAIN} истёк или истекает — обнови: vpn reality self ${SELF_DOMAIN}"; exit 1
+        fi
+        # 3x-ui считает XHTTP «tcp»-инбаундом и не даёт два инбаунда на одном номере порта
+        local busy
+        busy=$(api GET /inbounds/list | jq -r --argjson p "$port" '.obj[]? | select(.port == $p) | .remark' | head -1)
+        if [[ -n "$busy" || "$port" == "${PANEL_PORT:-}" || "$port" == "${SUB_PORT:-}" ]]; then
+            echo "Порт ${port} уже занят${busy:+ сервером «$busy»} (панель 3x-ui не даёт два сервера на одном номере порта). Укажи другой: vpn h3 on <порт>"; exit 1
+        fi
+        if listening "$port" udp; then echo "Порт ${port}/udp уже занят ($(ss -Hlunp "sport = :$port" | grep -o 'users:(("[^"]*' | cut -d'"' -f2 | head -1))"; exit 1; fi
+        if [[ -n "${HOP_PORTS:-}" ]]; then
+            local lo=${HOP_PORTS%-*} hi=${HOP_PORTS#*-}
+            (( port < lo || port > hi )) || { echo "Порт ${port} внутри диапазона port hopping (${HOP_PORTS}) — выбери другой"; exit 1; }
+        fi
+        [[ -n "$name" ]] || name=$(h3_default_name)
+        local res id emails
+        res=$(api_json POST /inbounds/add "$(h3_inbound_json "$port" "$SELF_DOMAIN" "/$(openssl rand -hex 6)" "$name")")
+        ok "$res"; id=$(jq -r .obj.id <<<"$res")
+        emails=$(all_emails)
+        if [[ "$emails" != "[]" ]]; then
+            ok "$(api_json POST /clients/bulkAttach "$(jq -nc --argjson e "$emails" --argjson i "[$id]" '{emails: $e, inboundIds: $i}')")"
+        fi
+        inbounds_add "$id"
+        env_set H3_ID "$id"; env_set H3_PORT "$port"
+        if command -v ufw >/dev/null; then ufw allow "${port}/udp" comment vless-xhttp-h3 >/dev/null 2>&1 || true; fi
+        if [[ -n "${FASTEST_ID:-}" ]]; then fastest_sync; fi
+        local i
+        for i in $(seq 1 10); do listening "$port" udp && break; sleep 1; done
+        listening "$port" udp || echo "Внимание: ${port}/udp пока никто не слушает — проверь: vpn check --local"
+        echo "XHTTP/3 включён: «${name}», ${SELF_DOMAIN}:${port}/udp (QUIC), все пользователи добавлены."
+        echo "Если у хостера свой фаервол — открой там ${port}/udp. В клиентах обнови подписку."
+        echo "Переименовать: vpn brand --h3-name \"…\". Проверка: vpn check --local"
+        ;;
+    off)
+        local id emails; id=$(h3_id)
+        [[ -n "$id" ]] || { echo "XHTTP/3 не включён"; return; }
+        emails=$(all_emails)
+        if [[ "$emails" != "[]" ]]; then
+            api_json POST /clients/bulkDetach "$(jq -nc --argjson e "$emails" --argjson i "[$id]" '{emails: $e, inboundIds: $i}')" >/dev/null || true
+        fi
+        ok "$(api POST "/inbounds/del/$id")"
+        if [[ -n "${H3_PORT:-}" ]] && command -v ufw >/dev/null; then ufw delete allow "${H3_PORT}/udp" >/dev/null 2>&1 || true; fi
+        inbounds_del "$id"
+        env_set H3_ID ""; env_set H3_PORT ""
+        if [[ -n "${FASTEST_ID:-}" ]]; then fastest_sync; fi
+        echo "XHTTP/3 выключен. В клиентах обнови подписку."
+        ;;
+    status|"")
+        if [[ -n "$(h3_id)" ]]; then echo "XHTTP/3 включён: «$(inbound_remark "$(h3_id)")», ${SELF_DOMAIN:-?}:${H3_PORT}/udp. Выключить: vpn h3 off"
+        else echo "XHTTP/3 выключен. Включить: vpn h3 on [порт, по умолчанию 4443] [--name «название»] (нужен vpn reality self)"; fi ;;
+    *) echo "Использование: vpn h3 on [порт] [--name Т] | off | status"; exit 1 ;;
     esac
 }
 
@@ -1228,6 +1335,7 @@ do_brand() {
                   elif .obj.subProfileMode == "builtin" then "подписка" else "-" end' <<<"$all")
     vname=$(inbound_remark "$(vless_id)"); hname=$(inbound_remark "$(hy2_id)")
     local xname=""; [[ -n "$(xhttp_id)" ]] && xname=$(inbound_remark "$(xhttp_id)")
+    local h3name=""; [[ -n "$(h3_id)" ]] && h3name=$(inbound_remark "$(h3_id)")
     local nflags=$#
     while [[ $# -gt 0 ]]; do
         a=$1; shift
@@ -1239,15 +1347,17 @@ do_brand() {
             --vless-name) vname=${1:-}; shift ;;
             --hy2-name) hname=${1:-}; shift ;;
             --xhttp-name) xname=${1:-}; shift ;;
+            --h3-name) h3name=${1:-}; shift ;;
             --auto-names) auto=yes ;;
             --show) echo "Название:   ${title}"; echo "Описание:   ${ann//$'\n'/ ⏎ }"; echo "Поддержка:  ${sup:--}"
-                    echo "Сайт:       ${site}"; echo "Серверы:    ${vname} | ${hname}${xname:+ | ${xname}}"; return ;;
+                    echo "Сайт:       ${site}"; echo "Серверы:    ${vname} | ${hname}${xname:+ | ${xname}}${h3name:+ | ${h3name}}"; return ;;
             *) echo "Неизвестный параметр: $a (см. vpn help)"; exit 1 ;;
         esac
     done
     if [[ $auto == yes ]]; then
         local lbl; lbl=$(country_label)
         vname="${lbl} · VLESS"; hname="${lbl} · Hysteria2"; [[ -n "$xname" ]] && xname="${lbl} · XHTTP"
+        [[ -n "$h3name" ]] && h3name="${lbl} · XHTTP H3"
     fi
     if (( nflags == 0 )); then
         [[ -r /dev/tty ]] || { echo "Нет терминала — задай параметры флагами (vpn help)"; exit 1; }
@@ -1263,6 +1373,7 @@ do_brand() {
         vname=$(prompt_keep "Название сервера VLESS" "$vname")
         hname=$(prompt_keep "Название сервера Hysteria2" "$hname")
         if [[ -n "$(xhttp_id)" ]]; then xname=$(prompt_keep "Название сервера XHTTP" "${xname:-${vname} · XHTTP}"); fi
+        if [[ -n "$(h3_id)" ]]; then h3name=$(prompt_keep "Название сервера XHTTP/3" "${h3name:-${vname} · XHTTP H3}"); fi
     fi
     ann=${ann//\\n/$'\n'}
     [[ "$sup" == "-" ]] && sup=""
@@ -1282,6 +1393,7 @@ do_brand() {
     inbound_patch "$(vless_id)" '.remark = $n' --arg n "$vname"
     inbound_patch "$(hy2_id)" '.remark = $n' --arg n "$hname"
     if [[ -n "$(xhttp_id)" && -n "$xname" ]]; then inbound_patch "$(xhttp_id)" '.remark = $n' --arg n "$xname"; fi
+    if [[ -n "$(h3_id)" && -n "$h3name" ]]; then inbound_patch "$(h3_id)" '.remark = $n' --arg n "$h3name"; fi
     echo "Сохранено. Перезапускаю панель (VPN моргнёт на пару секунд)…"
     systemctl restart x-ui
     local i
@@ -1338,6 +1450,9 @@ do_check() {
     if [[ -n "$(xhttp_id)" ]]; then
         listening "$XHTTP_PORT" tcp && r_ok "${XHTTP_PORT}/tcp слушается (VLESS XHTTP)" || r_fail "${XHTTP_PORT}/tcp (VLESS XHTTP) никто не слушает"
     fi
+    if [[ -n "$(h3_id)" && -n "${H3_PORT:-}" ]]; then
+        listening "$H3_PORT" udp && r_ok "${H3_PORT}/udp слушается (VLESS XHTTP/3)" || r_fail "${H3_PORT}/udp (VLESS XHTTP/3) никто не слушает"
+    fi
     if [[ -n "${HOP_PORTS:-}" ]]; then
         if iptables -t nat -C PREROUTING -p udp --dport "${HOP_PORTS/-/:}" -j REDIRECT --to-ports 443 2>/dev/null; then
             r_ok "Port hopping: UDP ${HOP_PORTS} → 443 (правило iptables на месте)"
@@ -1347,7 +1462,7 @@ do_check() {
     fi
     if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
         local miss="" p s; s=$(ufw status)
-        for p in 80/tcp 443/tcp 443/udp "${PANEL_PORT}/tcp" "${SUB_PORT}/tcp" ${XHTTP_PORT:+"${XHTTP_PORT}/tcp"}; do grep -q "^${p} " <<<"$s" || miss+=" $p"; done
+        for p in 80/tcp 443/tcp 443/udp "${PANEL_PORT}/tcp" "${SUB_PORT}/tcp" ${XHTTP_PORT:+"${XHTTP_PORT}/tcp"} ${H3_PORT:+"${H3_PORT}/udp"}; do grep -q "^${p} " <<<"$s" || miss+=" $p"; done
         [[ -z "$miss" ]] && r_ok "ufw: нужные порты открыты" || r_fail "ufw: не открыты:${miss} (ufw allow <порт>)"
     else
         r_warn "ufw выключен (работать будет, но сервер без фаервола)"
@@ -1384,7 +1499,7 @@ do_check() {
     fi
 
     echo "— Подписка и маскировка"
-    local hc sub links vl hy
+    local hc sub links vl hy h3=""
     hc=$(api GET "/clients/get/${HC_USER}" 2>/dev/null || true)
     if ! jq -e '.success == true' >/dev/null 2>&1 <<<"$hc"; then
         add_client "$HC_USER" 0 0 "служебный, для vpn check" >/dev/null 2>&1 || true
@@ -1394,11 +1509,16 @@ do_check() {
         sub="${SUB_BASE}$(jq -r .obj.client.subId <<<"$hc")"
         links=$(curl -sk --max-time 15 "$sub" | base64 -d 2>/dev/null || true)
         vl=$(grep -m1 '^vless://.*type=tcp' <<<"$links" || true); hy=$(grep -m1 '^hysteria2://' <<<"$links" || true)
-        xh=$(grep -m1 '^vless://.*type=xhttp' <<<"$links" || true)
+        xh=$(grep '^vless://.*type=xhttp' <<<"$links" | grep -m1 'security=reality' || true)
+        h3=$(grep '^vless://.*type=xhttp' <<<"$links" | grep -m1 'security=tls' || true)
         [[ -n "$vl" && -n "$hy" ]] && r_ok "Подписка отдаётся и содержит VLESS и Hysteria2" \
             || r_fail "Подписка ${SUB_BASE}… не отдаёт обе ссылки (VLESS: ${vl:+есть}${vl:-нет}, Hysteria2: ${hy:+есть}${hy:-нет})"
         if [[ -n "$(xhttp_id)" ]]; then
             [[ -n "$xh" ]] && r_ok "Подписка содержит VLESS XHTTP" || r_fail "В подписке нет ссылки VLESS XHTTP"
+        fi
+        if [[ -n "$(h3_id)" ]]; then
+            if [[ -n "$h3" ]] && grep -q 'alpn=h3' <<<"$h3"; then r_ok "Подписка содержит VLESS XHTTP/3 (alpn h3)"
+            else r_fail "В подписке нет ссылки VLESS XHTTP/3 с alpn=h3"; fi
         fi
         if [[ -n "${HOP_PORTS:-}" ]]; then
             grep -q "mport=" <<<"$hy" && r_ok "В ссылке Hysteria2 есть диапазон портов (mport)" || r_fail "В ссылке Hysteria2 нет mport"
@@ -1459,6 +1579,11 @@ do_check() {
         ip_out=$(e2e "$xh" 10873)
         [[ -n "$ip_out" ]] && r_ok "VLESS XHTTP работает, выход в интернет с IP ${ip_out}" \
             || r_fail "VLESS XHTTP: клиент не смог выйти в интернет через сервер"
+    fi
+    if [[ -n "${h3:-}" ]]; then
+        ip_out=$(e2e "$h3" 10875)
+        [[ -n "$ip_out" ]] && r_ok "VLESS XHTTP/3 (QUIC) работает, выход в интернет с IP ${ip_out}" \
+            || r_fail "VLESS XHTTP/3: клиент не смог выйти в интернет через сервер (открыт ли ${H3_PORT:-?}/udp у хостера?)"
     fi
     if [[ -n "${vl:-}" ]]; then
         ip_out=$(e2e "$vl" 10871)
@@ -1630,8 +1755,10 @@ vpn reality self <свой домен>            — Reality на свой до
 vpn brand                                — подпись подписки и названия серверов (мастер с вопросами)
 vpn brand --show                         — показать текущие
 vpn brand [--title Т] [--announce Т] [--support @user|URL|-] [--site URL|подписка|-]
-          [--vless-name Т] [--hy2-name Т] [--xhttp-name Т] [--auto-names]   — то же флагами
+          [--vless-name Т] [--hy2-name Т] [--xhttp-name Т] [--h3-name Т] [--auto-names] — то же флагами
 vpn xhttp on [порт] | off                — доп. сервер VLESS + XHTTP + Reality (по умолчанию порт 8443)
+vpn h3 on [порт] [--name Т] | off       — доп. сервер VLESS + XHTTP по HTTP/3 (QUIC, UDP) на своём домене
+                                           (нужен vpn reality self; по умолчанию порт 4443/udp)
 vpn hop on [от-до] | off                 — port hopping для Hysteria2 (по умолчанию UDP 20000-50000)
 vpn fastest on|off|status [--name Т] [--clients happ,v2raytun,incy]
                                          — сервер «Самый быстрый»: сам выбирает лучший протокол
@@ -1651,6 +1778,7 @@ xhttp) load_env; do_xhttp "$@" ;;
 hop) load_env; do_hop "$@" ;;
 fastest) load_env; do_fastest "$@" ;;
 trace) load_env; do_trace "$@" ;;
+h3) load_env; do_h3 "$@" ;;
 _hop) hop_rules "${1:-up}" "${2:-20000-50000}" ;;
 _country) country_label "${1:-}" ;;
 add)
