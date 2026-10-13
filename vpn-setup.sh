@@ -976,8 +976,17 @@ do_reality_self() { # <домен>
 
 # ---------------------------------------------------------------- ссылка подписки на своём домене
 SUB_DIR=/etc/vpn/sub
+wait_panel() { # ждать, пока панель ответит (после рестарта)
+    local i
+    for i in $(seq 1 40); do
+        if api GET /server/status 2>/dev/null | jq -e '.success == true' >/dev/null 2>&1; then return 0; fi
+        sleep 1
+    done
+    echo "Панель не поднялась за 40 секунд: systemctl status x-ui; journalctl -u x-ui -n 30" >&2; return 1
+}
 sub_apply() { # <subURI> <cert> <key> — записать в панель и перезапустить
     local all upd
+    wait_panel
     all=$(api POST /setting/all); ok "$all"
     upd=$(jq --arg uri "$1" --arg crt "$2" --arg key "$3" '.obj | .subURI = $uri | .subCertFile = $crt | .subKeyFile = $key' <<<"$all")
     ok "$(api_json POST /setting/update "$upd")"
@@ -1036,6 +1045,7 @@ do_subdomain() { # on <домен> | off | status
         env_set SUB_CERT "$crt"; env_set SUB_KEY "$key"
         if [[ "$crt" == "$SELF_DIR/fullchain.pem" && -x "$ACME_SH" ]]; then
             "$ACME_SH" --install-cert -d "$d" --ecc --key-file "$key" --fullchain-file "$crt" --reloadcmd "$(self_reload)" >/dev/null 2>&1 || true
+            wait_panel   # reloadcmd уже перезапустил панель
         fi
         echo "  Перезапускаю панель (VPN моргнёт на пару секунд)…"
         sub_apply "https://${d}:${SUB_PORT}${path}" "$crt" "$key"
