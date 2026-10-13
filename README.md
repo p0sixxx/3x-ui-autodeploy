@@ -251,17 +251,17 @@ vpn hop off
 - Если у хостера свой фаервол, откройте в нём порт XHTTP (8443/tcp) и, для hopping, UDP 20000–50000.
 - После включения или выключения обновите подписку в клиентах. `vpn check` проверяет оба режима: порт, правило iptables, ссылку в подписке и сквозной тест XHTTP.
 
-### XHTTP по HTTP/3: `vpn h3` (когда глушат TCP)
+### XHTTP по HTTP/3: `vpn http3` (когда глушат TCP)
 
 Если `vpn trace` показывает, что TCP-подключения к серверу пропадают после первого пакета, а Hysteria2 (UDP) работает, добавь второй UDP-путь: VLESS + XHTTP поверх **HTTP/3 (QUIC)** с настоящим TLS на твоём домене.
 
 ```
 vpn reality self cdn.домен.tech   # один раз: свой домен и сертификат
-vpn h3 on                         # 4443/udp; vpn h3 on <порт> --name "🇫🇮 VLESS H3"
-vpn h3 off
+vpn http3 on                         # 4443/udp; vpn http3 on <порт> --name "🇫🇮 VLESS HTTP3"
+vpn http3 off
 ```
 
-Сервер появится в подписке и в «⚡ Самом быстром». Его видят клиенты на Xray (INCY, Happ, v2RayTun), sing-box не поддерживает XHTTP. Если у хостера свой фаервол, открой там UDP-порт. Подробнее — в [гайде](docs/vpn-commands.md#vpn-h3--сервер-vless-xhttp-по-http3-quic-udp).
+Сервер появится в подписке и в «⚡ Самом быстром». Его видят клиенты на Xray (INCY, Happ, v2RayTun), sing-box не поддерживает XHTTP. Если у хостера свой фаервол, открой там UDP-порт. Подробнее — в [гайде](docs/vpn-commands.md#vpn-http3--сервер-vless-xhttp-по-http3-quic-udp).
 
 ## 9а. Сервер «Самый быстрый»
 
@@ -301,7 +301,7 @@ vpn fastest off                               # выключить
 | `vpn reality [auto\|<домен>\|<ip:443> <домен>]` | маскировка Reality |
 | `vpn reality self <свой домен>` | Reality на свой домен: сертификат, сайт-заглушка, SNI = домен |
 | `vpn xhttp on [порт] \| off` | сервер VLESS XHTTP |
-| `vpn h3 on [порт] \| off` | сервер VLESS XHTTP по HTTP/3 (QUIC, UDP) на своём домене |
+| `vpn http3 on [порт] \| off` | сервер VLESS XHTTP по HTTP/3 (QUIC, UDP) на своём домене |
 | `vpn hop on [от-до] \| off` | port hopping для Hysteria2 |
 | `vpn fastest [on\|off\|status] [--name Т] [--clients …]` | сервер «⚡ Самый быстрый» |
 | `vpn check [--local]` | полная диагностика (`--local` — без проверки снаружи) |
