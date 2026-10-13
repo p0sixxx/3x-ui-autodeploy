@@ -18,6 +18,8 @@
 #   XHTTP_PORT=8443            — порт доп. сервера VLESS + XHTTP + Reality (0 — не создавать)
 #   HOP_PORTS=20000-50000      — включить port hopping для Hysteria2 (по умолчанию выключен)
 #   FASTEST=0                  — не создавать сервер «Самый быстрый» (по умолчанию создаётся)
+#   NODE=1                     — поставить как ноду для главной панели: без своих пользователей,
+#                                в конце печатает команду «vpn node add …» для главного сервера
 #   NO_FIREWALL=1              — не трогать ufw
 #   SKIP_EXTERNAL_CHECK=1      — не проверять порты снаружи (check-host.net)
 #   ASSUME_YES=1               — на все вопросы отвечать «да» (без интерактива)
@@ -1501,13 +1503,16 @@ do_check() {
     echo "— Подписка и маскировка"
     local hc sub links vl hy h3=""
     hc=$(api GET "/clients/get/${HC_USER}" 2>/dev/null || true)
-    if ! jq -e '.success == true' >/dev/null 2>&1 <<<"$hc"; then
+    if ! jq -e '.success == true' >/dev/null 2>&1 <<<"$hc" && ! is_node; then
         add_client "$HC_USER" 0 0 "служебный, для vpn check" >/dev/null 2>&1 || true
         hc=$(api GET "/clients/get/${HC_USER}" 2>/dev/null || true)
     fi
+    local nlinks=""
     if jq -e '.success == true' >/dev/null 2>&1 <<<"$hc"; then
         sub="${SUB_BASE}$(jq -r .obj.client.subId <<<"$hc")"
         links=$(curl -sk --max-time 15 "$sub" | base64 -d 2>/dev/null || true)
+        nlinks=$(grep -v "@${PUBLIC_HOST}:" <<<"$links" || true)     # серверы нод
+        links=$(grep "@${PUBLIC_HOST}:" <<<"$links" || true)
         vl=$(grep -m1 '^vless://.*type=tcp' <<<"$links" || true); hy=$(grep -m1 '^hysteria2://' <<<"$links" || true)
         xh=$(grep '^vless://.*type=xhttp' <<<"$links" | grep -m1 'security=reality' || true)
         h3=$(grep '^vless://.*type=xhttp' <<<"$links" | grep -m1 'security=tls' || true)
@@ -1523,6 +1528,8 @@ do_check() {
         if [[ -n "${HOP_PORTS:-}" ]]; then
             grep -q "mport=" <<<"$hy" && r_ok "В ссылке Hysteria2 есть диапазон портов (mport)" || r_fail "В ссылке Hysteria2 нет mport"
         fi
+    elif is_node; then
+        r_warn "Нода ещё не подключена к главной панели (нет пользователя ${HC_USER}) — подписку и сквозной тест проверю после vpn node add на главном"
     else
         r_fail "Не удалось получить служебного пользователя ${HC_USER}"
     fi
@@ -1568,6 +1575,19 @@ do_check() {
         fi
     fi
 
+    local nodes=""
+    if ! is_node; then nodes=$(node_list_json 2>/dev/null || true); fi
+    if [[ -n "$nodes" && "$nodes" != "[]" ]]; then
+        echo "— Ноды"
+        local nl nname naddr nst nids nmiss
+        while IFS=$'\t' read -r nname naddr nst nl; do
+            [[ "$nst" == online ]] && r_ok "Нода ${nname} (${naddr}) в сети, ${nl} мс" || r_fail "Нода ${nname} (${naddr}): ${nst} — проверь сервер и его панель"
+        done < <(jq -r '.[] | [.name, .address, (.status // "?"), (.latencyMs // 0 | tostring)] | @tsv' <<<"$nodes")
+        nids=$(node_inbound_ids 2>/dev/null || echo '[]')
+        nmiss=$(jq -c --argjson ib "$INBOUNDS" '[.[] | select(. as $x | $ib | index($x) | not)]' <<<"$nids")
+        [[ "$nmiss" == "[]" ]] && r_ok "Все серверы нод ($(jq length <<<"$nids") шт.) в подписке у всех пользователей" \
+            || r_fail "Серверы нод не подключены к пользователям: id ${nmiss} — выполни: vpn node sync"
+    fi
     echo "— Сквозной тест (локальный клиент → сервер → интернет)"
     local ip_out
     if [[ -n "$fj" ]]; then
@@ -1595,6 +1615,17 @@ do_check() {
         [[ -n "$ip_out" ]] && r_ok "Hysteria2 работает, выход в интернет с IP ${ip_out}" \
             || r_fail "Hysteria2: клиент не смог выйти в интернет через сервер"
     fi
+    if [[ -n "${nlinks:-}" ]]; then
+        local nlink nname2 sp=10880
+        while IFS= read -r nlink; do
+            [[ "$nlink" =~ ^(vless|hysteria2):// ]] || continue
+            nname2=$(python3 -c 'import sys,urllib.parse as u; print(u.unquote(sys.argv[1].split("#",1)[1]) if "#" in sys.argv[1] else "?")' "$nlink" 2>/dev/null || echo "?")
+            sp=$((sp + 1))
+            ip_out=$(e2e "$nlink" "$sp")
+            [[ -n "$ip_out" ]] && r_ok "Нода: ${nname2} работает, выход в интернет с IP ${ip_out}" \
+                || r_fail "Нода: ${nname2} — клиент не смог выйти в интернет через неё"
+        done <<<"$nlinks"
+    fi
 
     if [[ "$external" == yes ]]; then
         echo "— Доступность снаружи (check-host.net)"
@@ -1620,6 +1651,163 @@ do_check() {
     echo
     echo -e "Итог: ${c_g}${N_OK} OK${c_0}, ${c_y}${N_WARN} предупреждений${c_0}, ${c_r}${N_FAIL} ошибок${c_0}"
     (( N_FAIL == 0 ))
+}
+
+# ---------------------------------------------------------------- ноды: несколько серверов в одной подписке
+# Главная панель (этот сервер) управляет другими 3x-ui (нодами) через их API: пользователи, лимиты,
+# трафик и подписка — здесь, серверы нод попадают в ту же подписку и в «Самый быстрый».
+XUI_CLI=${XUI_CLI:-/usr/local/x-ui/x-ui}
+is_node() { [[ "${ROLE:-}" == node ]]; }
+node_guard() {
+    if is_node; then
+        echo "Это нода: пользователями управляет главная панель. Выполни команду на главном сервере."; exit 1
+    fi
+}
+node_list_json() { local r; r=$(api GET /nodes/list); ok "$r"; jq -c '[.obj[]?]' <<<"$r"; }
+node_inbound_ids() { # [id ноды] → JSON-массив id серверов нод на главной панели
+    local r; r=$(api GET /inbounds/list); ok "$r"
+    jq -c --arg n "${1:-}" '[.obj[]? | select(.nodeId != null and ($n == "" or (.nodeId | tostring) == $n)) | .id]' <<<"$r"
+}
+node_find() { # <имя|id> → id ноды
+    node_list_json | jq -r --arg k "$1" '.[] | select(.name == $k or (.id | tostring) == $k) | .id' | head -1
+}
+node_parse_url() { # <https://адрес:порт/путь/> → NU_SCHEME NU_HOST NU_PORT NU_PATH
+    [[ "$1" =~ ^(https?)://([^/:]+):([0-9]+)(/.*)?$ ]] || return 1
+    NU_SCHEME=${BASH_REMATCH[1]}; NU_HOST=${BASH_REMATCH[2]}; NU_PORT=${BASH_REMATCH[3]}; NU_PATH=${BASH_REMATCH[4]:-/}
+    [[ "$NU_PATH" == */ ]] || NU_PATH="$NU_PATH/"
+}
+node_sync() { # все пользователи → на все серверы нод; INBOUNDS и «Самый быстрый» — по факту. Печатает число новых серверов
+    local ids all emails id cur miss new=0
+    all=$(api GET /inbounds/list | jq -c '[.obj[]?.id]')
+    env_set INBOUNDS "$(jq -c --argjson a "$all" '[.[] | select(. as $x | $a | index($x))]' <<<"$INBOUNDS")"
+    ids=$(node_inbound_ids)
+    emails=$(all_emails)
+    for id in $(jq -r '.[]' <<<"$ids"); do
+        if ! jq -e --argjson id "$id" 'index($id)' <<<"$INBOUNDS" >/dev/null; then inbounds_add "$id"; new=$((new + 1)); fi
+        cur=$(api GET "/inbounds/get/$id" | jq -c '[.obj.settings | (if type == "string" then fromjson else . end) | .clients[]?.email]')
+        miss=$(jq -c --argjson c "$cur" '[.[] | select(. as $e | $c | index($e) | not)]' <<<"$emails")
+        if [[ "$miss" != "[]" ]]; then
+            ok "$(api_json POST /clients/bulkAttach "$(jq -nc --argjson e "$miss" --argjson i "[$id]" '{emails: $e, inboundIds: $i}')")"
+        fi
+    done
+    if [[ -n "${FASTEST_ID:-}" ]]; then fastest_sync; fi
+    echo "$new"
+}
+node_token() { # новый API-токен «master» на этой ноде (старый перестаёт работать)
+    local t
+    t=$("$XUI_CLI" setting -getApiToken -tokenName master 2>/dev/null | grep -Eo 'apiToken: .+' | awk '{print $2}' || true)
+    [[ -n "$t" ]] || { echo "Не удалось получить API-токен 3x-ui"; exit 1; }
+    echo "$t"
+}
+do_node() {
+    local action=${1:-list}; [[ $# -gt 0 ]] && shift
+    case "$action" in
+    list)
+        if is_node; then echo "Этот сервер — нода. Пользователи и подписка — на главной панели."; return; fi
+        local nodes ids
+        nodes=$(node_list_json)
+        if [[ "$nodes" == "[]" ]]; then echo "Нод нет. Добавить: vpn node add <адрес панели ноды> <токен> (см. vpn help)"; return; fi
+        ids=$(api GET /inbounds/list)
+        jq -r --argjson ib "$ids" '.[] | . as $n |
+            "\(.name)  \(.address)  \(if .status == "online" then "в сети, \(.latencyMs) мс" else (.status // "?") end)  Xray \(.xrayVersion // "?")",
+            ($ib.obj[]? | select(.nodeId == $n.id) | "    \(.remark)  (\(.protocol), порт \(.port))")' <<<"$nodes"
+        ;;
+    add)
+        node_guard
+        local url=${1:-} tok=${2:-} name="" a; shift 2 2>/dev/null || true
+        while [[ $# -gt 0 ]]; do a=$1; shift; case "$a" in --name) name=${1:-}; shift ;; *) echo "Неизвестный параметр: $a"; exit 1 ;; esac; done
+        [[ -n "$url" && -n "$tok" ]] || { echo "Использование: vpn node add <https://адрес:порт/путь/> <токен> [--name имя]"; echo "Адрес и токен печатает на ноде: vpn node prepare"; exit 1; }
+        node_parse_url "$url" || { echo "Адрес панели ноды — вида https://1.2.3.4:12345/путь/"; exit 1; }
+        [[ -n "$name" ]] || name="node-${NU_HOST}"
+        [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "Имя ноды — латиница, цифры, . _ -"; exit 1; }
+        local napi="${NU_SCHEME}://${NU_HOST}:${NU_PORT}${NU_PATH}panel/api" cl tls=verify had
+        had=$(node_list_json | jq -r --arg h "$NU_HOST" --arg n "$name" '.[] | select(.address == $h or .name == $n) | .name' | head -1)
+        [[ -z "$had" ]] || { echo "Нода с таким адресом или именем уже подключена: «${had}» (vpn node). Новые серверы на ней: vpn node sync"; exit 1; }
+        echo "Проверяю ноду ${NU_HOST}…"
+        if ! cl=$(curl -s --max-time 15 -H "Authorization: Bearer $tok" "$napi/clients/list" 2>/dev/null) || [[ -z "$cl" ]]; then
+            if [[ $NU_SCHEME == https ]] && cl=$(curl -sk --max-time 15 -H "Authorization: Bearer $tok" "$napi/clients/list" 2>/dev/null) && [[ -n "$cl" ]]; then
+                tls=skip; echo "  Внимание: сертификат панели ноды не прошёл проверку — подключаю без неё (tls: skip)"
+            fi
+        fi
+        jq -e '.success == true' >/dev/null 2>&1 <<<"$cl" || { echo "API ноды не ответило (адрес, порт, токен, фаервол?): ${cl:0:200}"; exit 1; }
+        if [[ "$(jq '[.obj[]?] | length' <<<"$cl")" != 0 ]]; then
+            echo "На ноде уже есть пользователи: $(jq -r '[.obj[]?.email] | join(", ")' <<<"$cl")."
+            echo "Их имена совпадут с пользователями главной панели и испортят им подписки. На ноде выполни: vpn node prepare"
+            exit 1
+        fi
+        local body r nid i ids n priv=false
+        [[ "$NU_HOST" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|127\.) ]] && priv=true   # адрес во внутренней сети
+        body=$(jq -n --arg name "$name" --arg sch "$NU_SCHEME" --arg h "$NU_HOST" --argjson p "$NU_PORT" --arg bp "$NU_PATH" \
+            --arg t "$tok" --arg tls "$tls" --argjson priv "$priv" '{name: $name, remark: $name, scheme: $sch, address: $h, port: $p, basePath: $bp,
+            apiToken: $t, enable: true, allowPrivateAddress: $priv, tlsVerifyMode: $tls, inboundSyncMode: "all"}')
+        r=$(api_json POST /nodes/test "$body")
+        jq -e '.success == true and .obj.status == "online"' >/dev/null 2>&1 <<<"$r" \
+            || { echo "Главная панель не достучалась до ноды: $(jq -r '.obj.error // .msg // "?"' <<<"$r" 2>/dev/null)"; exit 1; }
+        r=$(api_json POST /nodes/add "$body"); ok "$r"; nid=$(jq -r .obj.id <<<"$r")
+        echo "  Нода «${name}» добавлена, жду её серверы…"
+        for i in $(seq 1 40); do ids=$(node_inbound_ids "$nid"); [[ "$ids" != "[]" ]] && break; sleep 1; done
+        [[ "$ids" != "[]" ]] || { echo "Серверы ноды не появились за 40 с. Проверь: vpn node, затем vpn node sync"; exit 1; }
+        sleep 3
+        n=$(node_sync)
+        echo "Готово: нода «${name}» (${NU_HOST}), серверов: $(jq length <<<"$(node_inbound_ids "$nid")"). Все пользователи добавлены на её серверы."
+        echo "В клиентах обнови подписку — серверы ноды появятся в ней и в «Самом быстром». Проверка: vpn check --local"
+        ;;
+    sync)
+        node_guard
+        local n; n=$(node_sync)
+        echo "Синхронизировано: новых серверов нод — ${n}; все пользователи есть на всех серверах. В клиентах обнови подписку."
+        ;;
+    del)
+        node_guard
+        local key=${1:-} nid ids emails id
+        [[ -n "$key" ]] || { echo "Использование: vpn node del <имя>"; exit 1; }
+        nid=$(node_find "$key"); [[ -n "$nid" ]] || { echo "Нода «$key» не найдена (vpn node)"; exit 1; }
+        ids=$(node_inbound_ids "$nid"); emails=$(all_emails)
+        for id in $(jq -r '.[]' <<<"$ids"); do
+            if [[ "$emails" != "[]" ]]; then
+                api_json POST /clients/bulkDetach "$(jq -nc --argjson e "$emails" --argjson i "[$id]" '{emails: $e, inboundIds: $i}')" >/dev/null || true
+            fi
+        done
+        # выключенная нода: панель удаляет свои копии её серверов, не трогая саму ноду; потом — саму ноду
+        ok "$(api_json POST "/nodes/setEnable/$nid" '{"enable": false}')"
+        for id in $(jq -r '.[]' <<<"$ids"); do ok "$(api POST "/inbounds/del/$id")"; inbounds_del "$id"; done
+        ok "$(api POST "/nodes/del/$nid")"
+        if [[ -n "${FASTEST_ID:-}" ]]; then fastest_sync; fi
+        echo "Нода «$key» отключена: пользователи сняты с её серверов, серверы убраны из подписки."
+        echo "Сама нода не тронута (её 3x-ui и серверы остались). В клиентах обнови подписку."
+        ;;
+    prepare)
+        [[ -n "${PANEL_URL:-}" ]] || { echo "Нет PANEL_URL в $ENV_FILE"; exit 1; }
+        if ! is_node; then
+            local cl n e
+            cl=$(api GET /clients/list); ok "$cl"; n=$(jq '[.obj[]?] | length' <<<"$cl")
+            echo "Готовлю этот сервер как ноду для главной панели."
+            if (( n > 0 )); then
+                echo "На нём будут удалены пользователи: $(jq -r '[.obj[]?.email] | join(", ")' <<<"$cl")."
+                echo "Пользователями будет управлять главная панель."
+                if [[ "${1:-}" != --yes ]]; then
+                    local a=""
+                    if ! read -r -p "Продолжить? [y/N] " a </dev/tty 2>/dev/null; then echo; echo "Нет терминала — подтверди так: vpn node prepare --yes"; exit 1; fi
+                    [[ "$a" =~ ^[yYдД] ]] || { echo "Отменено"; exit 1; }
+                fi
+                for e in $(jq -r '.obj[]?.email' <<<"$cl"); do ok "$(api POST "/clients/del/$e")"; done
+            fi
+            if [[ -n "${FASTEST_ID:-}" ]]; then do_fastest off >/dev/null 2>&1 || true; fi
+            env_set ROLE node
+        fi
+        local t cc nm
+        t=$(node_token)
+        cc=$(curl -fsS --max-time 6 "https://ipinfo.io/${SERVER_IP}/country" 2>/dev/null | tr -dc 'A-Za-z' | tr 'A-Z' 'a-z' | head -c 2 || true)
+        nm="${cc:-node}-$(hostname -s 2>/dev/null | tr -c 'A-Za-z0-9._\n-' '-' | cut -c1-20)"
+        echo
+        echo "Сервер готов как нода. На ГЛАВНОМ сервере выполни:"
+        echo
+        echo "  vpn node add ${PANEL_URL} ${t} --name ${nm%-}"
+        echo
+        echo "Токен даёт полный доступ к панели этой ноды — не публикуй его. Новый токен: vpn node prepare (старый перестанет работать)."
+        ;;
+    *) echo "Использование: vpn node [list] | add <адрес> <токен> [--name имя] | sync | del <имя> | prepare"; exit 1 ;;
+    esac
 }
 
 # ---------------------------------------------------------------- vpn trace
@@ -1748,6 +1936,10 @@ vpn off|on <имя>                         — отключить / включ�
 vpn del <имя>                            — удалить
 vpn panel                                — адрес и логин панели
 vpn check [--local]                      — полная диагностика (--local: без проверки снаружи)
+vpn node                                 — ноды (другие серверы в этой же подписке): список
+vpn node add <адрес панели> <токен> [--name имя] — подключить сервер-ноду (адрес и токен: vpn node prepare на ноде)
+vpn node sync | del <имя>                — дотянуть новые серверы нод и всех пользователей / отключить ноду
+vpn node prepare                         — (на новом сервере) сделать его нодой и показать команду для главного
 vpn trace [IP] [секунд]                  — запись подключений клиентов и разбор: дошло ли, ответил ли сервер
 vpn reality [auto|<домен>|<ip:443> <домен>] — маскировка Reality: показать / подобрать в сети хостера / задать
 vpn reality self <свой домен>            — Reality на свой домен (A-запись → этот сервер): сертификат, сайт-заглушка,
@@ -1776,13 +1968,14 @@ reality) load_env; do_reality "$@" ;;
 brand) load_env; do_brand "$@" ;;
 xhttp) load_env; do_xhttp "$@" ;;
 hop) load_env; do_hop "$@" ;;
-fastest) load_env; do_fastest "$@" ;;
+fastest) load_env; node_guard; do_fastest "$@" ;;
 trace) load_env; do_trace "$@" ;;
 http3) load_env; do_http3 "$@" ;;
+node) load_env; do_node "$@" ;;
 _hop) hop_rules "${1:-up}" "${2:-20000-50000}" ;;
 _country) country_label "${1:-}" ;;
 add)
-    load_env
+    load_env; node_guard
     parse_limits "$@"; set -- "${REST[@]+"${REST[@]}"}"
     [[ $# -ge 3 ]] || { usage; exit 1; }
     check_name "$1"; is_num "$2" && is_num "$3" || { echo "ГБ и дни — числа"; exit 1; }
@@ -1793,8 +1986,8 @@ add)
     if (( ips > 0 )); then fail2ban_note; fi
     show_link "$1"
     ;;
-limit) load_env; do_limit "$@" ;;
-devices) load_env; do_devices "$@" ;;
+limit) load_env; node_guard; do_limit "$@" ;;
+devices) load_env; node_guard; do_devices "$@" ;;
 list)
     load_env
     r=$(api GET /clients/list); ok "$r"
@@ -1816,7 +2009,7 @@ list)
     ;;
 link) load_env; check_name "${1:-}"; show_link "$1" ;;
 renew)
-    load_env
+    load_env; node_guard
     [[ $# -ge 2 ]] || { usage; exit 1; }
     check_name "$1"; is_num "$2" || { echo "Дни — число"; exit 1; }
     c=$(get_client "$1"); cur=$(jq -r '.expiryTime // 0' <<<"$c"); base=$(now_ms)
@@ -1831,13 +2024,13 @@ renew)
     echo "Продлён: $1, ${until_s}, трафик обнулён"
     if (( exp > 0 && exp < $(now_ms) )); then echo "Внимание: срок уже истёк — пользователь не подключится. Продли на N дней: vpn renew $1 30"; fi
     ;;
-reset) load_env; check_name "${1:-}"; ok "$(api POST "/clients/resetTraffic/$1")"; echo "Трафик $1 обнулён" ;;
+reset) load_env; node_guard; check_name "${1:-}"; ok "$(api POST "/clients/resetTraffic/$1")"; echo "Трафик $1 обнулён" ;;
 off|on)
-    load_env; check_name "${1:-}"; en=true; [[ $cmd == off ]] && en=false
+    load_env; node_guard; check_name "${1:-}"; en=true; [[ $cmd == off ]] && en=false
     save_client "$(jq --argjson en $en '.enable = $en' <<<"$(get_client "$1")")"
     echo "$1: $([[ $en == true ]] && echo включён || echo отключён)"
     ;;
-del) load_env; check_name "${1:-}"; ok "$(api POST "/clients/del/$1")"; echo "Удалён: $1" ;;
+del) load_env; node_guard; check_name "${1:-}"; ok "$(api POST "/clients/del/$1")"; echo "Удалён: $1" ;;
 panel) cat /etc/vpn/panel.txt ;;
 check) load_env; if [[ "${1:-}" == --local ]]; then do_check no; else do_check yes; fi ;;
 *) usage ;;
@@ -1847,7 +2040,25 @@ VPNCLI
 }
 
 # =========================================================================== итог
+finish_node() {
+    log "Готовлю сервер как ноду и проверяю"
+    if [[ "$XHTTP_PORT" != 0 ]]; then vpn xhttp on "$XHTTP_PORT" | sed 's/^/    /'; fi
+    if [[ -n "${HOP_PORTS:-}" ]]; then vpn hop on "$HOP_PORTS" | sed 's/^/    /'; fi
+    local rc=0
+    ( umask 077; vpn node prepare --yes > "$VPN_DIR/node-add.txt" )
+    vpn check | tee "$VPN_DIR/check-install.txt" || rc=$?
+    echo
+    echo -e "${c_b}================ НОДА ГОТОВА ================${c_0}"
+    cat "$VPN_DIR/panel.txt"
+    cat "$VPN_DIR/node-add.txt"
+    echo "Команда сохранена в ${VPN_DIR}/node-add.txt. Свой домен для маскировки: vpn reality self <поддомен>"
+    if (( rc != 0 )); then
+        echo -e "\n${c_y}Проверка нашла ошибки (см. [FAIL] выше). Исправь и перепроверь: vpn check${c_0}"
+    fi
+}
+
 finish() {
+    if [[ "${NODE:-0}" == 1 ]]; then finish_node; return; fi
     log "Создаю твоего пользователя и проверяю всё целиком"
     if [[ "$XHTTP_PORT" != 0 ]]; then vpn xhttp on "$XHTTP_PORT" | sed 's/^/    /'; fi
     if [[ -n "${HOP_PORTS:-}" ]]; then vpn hop on "$HOP_PORTS" | sed 's/^/    /'; fi
