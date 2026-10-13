@@ -888,6 +888,28 @@ self_nginx() { # <домен> <порт>
     v=$(nginx -v 2>&1 | grep -Eo '[0-9]+\.[0-9]+' | head -1)
     if [[ -n "$v" ]] && (( ${v%.*} > 1 || ${v#*.} >= 25 )); then h2="listen 127.0.0.1:$2 ssl;
     http2 on;"; fi
+    local sub_loc=""
+    if [[ -n "${SUB_SHORT:-}" && -n "${SUB_PATH:-}" ]]; then   # короткая ссылка подписки: https://домен/<ID>
+        sub_loc="
+    # подписка: https://$1/<ID> -> сервер подписок панели (ID: буквы, цифры, _ и -)
+    location ~ \"^/[A-Za-z0-9_-]{6,64}\$\" {
+        rewrite ^/(.*)\$ ${SUB_PATH%/}/\$1 break;
+        proxy_pass https://127.0.0.1:${SUB_PORT};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_read_timeout 60s;
+    }
+    # страница подписки (html=1) и ссылки со старым путём
+    location ^~ ${SUB_PATH%/}/ {
+        proxy_pass https://127.0.0.1:${SUB_PORT};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-Host \$host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Real-IP \$remote_addr;
+    }"
+    fi
     cat > "$SELF_NGINX" <<NGX
 # vpn reality self — сайт-маскировка Reality, доступен только через Xray (порт 443)
 server {
@@ -902,7 +924,7 @@ server {
     ssl_session_cache shared:VPNSELF:10m;
     root $SELF_WWW;
     index index.html;
-    location / { try_files \$uri \$uri/ =404; }
+    location / { try_files \$uri \$uri/ =404; }${sub_loc}
 }
 NGX
     nginx -t >/dev/null 2>&1 || { nginx -t; echo "Конфиг nginx с ошибкой: $SELF_NGINX"; exit 1; }
@@ -1000,7 +1022,15 @@ sub_tls_ok() { # <домен> — сервер подписок отвечает
     done
     return 1
 }
-do_subdomain() { # on <домен> | off | status
+sub_short_possible() { # <домен> — домен Reality на 443: через него можно отдавать подписку без порта
+    local ib
+    [[ "$1" == "${SELF_DOMAIN:-}" && -n "${SELF_PORT:-}" && -f "$SELF_NGINX" ]] || return 1
+    ib=$(reality_inbound) || return 1
+    [[ "$(jq -r .port <<<"$ib")" == 443 ]] || return 1
+    [[ "$(jq -r '.streamSettings | (if type == "string" then fromjson else . end) | .realitySettings | (.target // .dest)' <<<"$ib")" == "127.0.0.1:${SELF_PORT}" ]]
+}
+sub_first_id() { api GET /clients/list | jq -r '[.obj[]? | select(.subId != null and .subId != "")][0].subId // empty'; }
+do_subdomain() { # <домен> [--port] | off | status
     node_guard
     local act=${1:-status} all path
     all=$(api POST /setting/all); ok "$all"; path=$(jq -r .obj.subPath <<<"$all")
@@ -1008,7 +1038,7 @@ do_subdomain() { # on <домен> | off | status
     status)
         echo "Ссылка подписки: ${SUB_BASE}<ID>"
         if [[ -n "${SUB_DOMAIN:-}" ]]; then
-            echo "Домен подписки: ${SUB_DOMAIN}, сертификат до $(openssl x509 -in "$SUB_CERT" -noout -enddate 2>/dev/null | cut -d= -f2)"
+            echo "Домен подписки: ${SUB_DOMAIN}$([[ -n "${SUB_SHORT:-}" ]] && echo ", короткая ссылка через 443 (nginx → сервер подписок)"), сертификат до $(openssl x509 -in "$SUB_CERT" -noout -enddate 2>/dev/null | cut -d= -f2)"
         else
             echo "Домен подписки не задан — ссылки идут на ${PUBLIC_HOST}. Включить: vpn sub-domain <домен>"
         fi
@@ -1020,11 +1050,13 @@ do_subdomain() { # on <домен> | off | status
         sub_apply "${sch}://${PUBLIC_HOST}:${SUB_PORT}${path}" "$crt" "$key"
         env_set SUB_BASE "${sch}://${PUBLIC_HOST}:${SUB_PORT}${path}"
         env_set SUB_DOMAIN ""; env_set SUB_CERT ""; env_set SUB_KEY ""
+        if [[ -n "${SUB_SHORT:-}" ]]; then env_set SUB_SHORT ""; self_nginx "${SELF_DOMAIN}" "${SELF_PORT}"; fi
         echo "Подписки снова на ${PUBLIC_HOST}. В клиентах добавь подписку заново: vpn link <имя>"
         ;;
     *)
-        local d=${act,,} ips crt key old_uri old_crt old_key
-        [[ "$d" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$ ]] || { echo "Использование: vpn sub-domain <домен> | off | status"; exit 1; }
+        local d=${act,,} ips crt key old_uri old_crt old_key short="" force_port=0 base sid code was_short=${SUB_SHORT:-}
+        [[ "${2:-}" == --port ]] && force_port=1
+        [[ "$d" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$ ]] || { echo "Использование: vpn sub-domain <домен> [--port] | off | status"; exit 1; }
         ips=$(self_ipv4 "$d")
         [[ -n "$ips" ]] || { echo "У $d нет A-записи. Создай A-запись $d → ${SERVER_IP} и подожди 5–15 минут."; exit 1; }
         [[ " $ips " == *" ${SERVER_IP} "* ]] || { echo "A-запись $d указывает на ${ips}, а не на этот сервер (${SERVER_IP})."; exit 1; }
@@ -1039,6 +1071,11 @@ do_subdomain() { # on <домен> | off | status
         fi
         openssl x509 -in "$crt" -noout -checkhost "$d" 2>/dev/null | grep -q 'does match' \
             || { echo "Сертификат $crt не выпущен на $d"; exit 1; }
+        if (( ! force_port )) && sub_short_possible "$d"; then
+            short=1; echo "  Ссылка без порта: через 443 (Reality отдаёт чужие запросы в nginx, он передаёт их серверу подписок)"
+        else
+            echo "  Ссылка с портом ${SUB_PORT}$( (( force_port )) && echo ' (--port)' || echo ': домен не Reality на 443, см. vpn reality self')"
+        fi
         old_uri=$(jq -r .obj.subURI <<<"$all"); old_crt=$(jq -r .obj.subCertFile <<<"$all"); old_key=$(jq -r .obj.subKeyFile <<<"$all")
         if [[ -z "${SUB_DOMAIN:-}" ]]; then env_set SUB_CERT_ORIG "$old_crt"; env_set SUB_KEY_ORIG "$old_key"; fi
         # сертификат Reality-домена продлевается с рестартом панели — обновим команду в acme.sh
@@ -1047,20 +1084,36 @@ do_subdomain() { # on <домен> | off | status
             "$ACME_SH" --install-cert -d "$d" --ecc --key-file "$key" --fullchain-file "$crt" --reloadcmd "$(self_reload)" >/dev/null 2>&1 || true
             wait_panel   # reloadcmd уже перезапустил панель
         fi
+        if [[ -n "$short" ]]; then base="https://${d}/"; else base="https://${d}:${SUB_PORT}${path}"; fi
         echo "  Перезапускаю панель (VPN моргнёт на пару секунд)…"
-        sub_apply "https://${d}:${SUB_PORT}${path}" "$crt" "$key"
-        if ! sub_tls_ok "$d"; then
-            echo "Сервер подписок не отвечает по https://$d:${SUB_PORT} — возвращаю прежние настройки."
+        sub_apply "$base" "$crt" "$key"
+        env_set SUB_PATH "$path"; env_set SUB_SHORT "$short"
+        if [[ -n "$short" ]] || [[ -n "$was_short" ]]; then self_nginx "$SELF_DOMAIN" "$SELF_PORT"; fi
+        if ! sub_tls_ok "$d"; then code=1
+        elif [[ -n "$short" ]]; then
+            sid=$(sub_first_id); code=1
+            if [[ -z "$sid" ]]; then code=0   # пользователей нет — проверить нечем
+            else
+                local i
+                for i in 1 2 3 4 5; do
+                    [[ "$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 10 "https://${d}/${sid}" 2>/dev/null)" == 200 ]] && { code=0; break; }
+                    sleep 1
+                done
+            fi
+        else code=0; fi
+        if (( code != 0 )); then
+            echo "Подписка не отдаётся по ${base} — возвращаю прежние настройки."
             sub_apply "$old_uri" "$old_crt" "$old_key"
-            env_set SUB_CERT ""; env_set SUB_KEY ""
-            echo "Проверь, что порт ${SUB_PORT}/tcp открыт (у хостера тоже): journalctl -u x-ui -n 30"
+            env_set SUB_CERT ""; env_set SUB_KEY ""; env_set SUB_SHORT ""
+            if [[ -n "$short" ]]; then self_nginx "$SELF_DOMAIN" "$SELF_PORT"; fi
+            echo "Проверь: vpn check --local; journalctl -u x-ui -n 30; nginx -t"
             exit 1
         fi
         env_set SUB_DOMAIN "$d"
-        env_set SUB_BASE "https://${d}:${SUB_PORT}${path}"
-        echo "Готово: подписки теперь https://${d}:${SUB_PORT}${path}<ID>"
-        echo "Ссылки на старый адрес (IP) работать не будут — у каждого пользователя новую покажет vpn link <имя>."
-        echo "Подписка у клиентов с новым адресом добавляется заново (ID пользователя тот же)."
+        env_set SUB_BASE "$base"
+        echo "Готово: подписки теперь ${base}<ID>"
+        echo "Ссылки на старый адрес работать не будут — у каждого пользователя новую покажет vpn link <имя>."
+        echo "В клиентах подписку нужно добавить заново (ID пользователя тот же)."
         ;;
     esac
 }
@@ -2049,8 +2102,9 @@ vpn trace [IP] [секунд]                  — запись подключе
 vpn reality [auto|<домен>|<ip:443> <домен>] — маскировка Reality: показать / подобрать в сети хостера / задать
 vpn reality self <свой домен>            — Reality на свой домен (A-запись → этот сервер): сертификат, сайт-заглушка,
                                            SNI = домен. Лучшая защита от блокировок по SNI
-vpn sub-domain <домен> | off | status    — ссылка подписки на своём домене вместо IP (A-запись → этот сервер,
-                                           сертификат Let's Encrypt; Reality-домен переиспользуется)
+vpn sub-domain <домен> [--port] | off | status
+                                         — ссылка подписки на своём домене: https://домен/<ID> (без порта, через 443,
+                                           если это домен vpn reality self) или с портом (--port / другой домен)
 vpn brand                                — подпись подписки и названия серверов (мастер с вопросами)
 vpn brand --show                         — показать текущие
 vpn brand [--title Т] [--announce Т] [--support @user|URL|-] [--site URL|подписка|-]
