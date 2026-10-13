@@ -263,7 +263,7 @@ vpn http3                                       # статус
 vpn http3 off                                   # выключить
 ```
 
-Сервер появится в подписке и в «⚡ Самом быстром». Его видят клиенты на Xray (INCY, Happ, v2RayTun), sing-box XHTTP не поддерживает. Если у хостера свой фаервол, открой там UDP-порт. Подробнее — в [гайде](docs/vpn-commands.md#vpn-http3--сервер-http3-vless-xhttp-по-http3-quicudp).
+Сервер появится в подписке и в «⚡ Самом быстром». Работает в клиентах на Xray (INCY, Happ, v2RayTun). На роутерах — нет: sing-box XHTTP не поддерживает, а Tachyon (tachyon-core) умеет XHTTP только поверх TCP и показывает HTTP3 как n/a. Роутерам — Hysteria2. Если у хостера свой фаервол, открой там UDP-порт. Подробнее — в [гайде](docs/vpn-commands.md#vpn-http3--сервер-http3-vless-xhttp-по-http3-quicudp).
 
 ## 9а. Сервер «Самый быстрый»
 
