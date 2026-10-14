@@ -1118,6 +1118,51 @@ do_subdomain() { # <домен> [--port] | off | status
     esac
 }
 
+# ---------------------------------------------------------------- доступ к панели
+panel_local_url() { sed -E 's|//[^:/]+:|//127.0.0.1:|' <<<"$PANEL_URL"; }
+do_panel() { # [hide|show|status]
+    case "${1:-}" in
+    "") cat /etc/vpn/panel.txt
+        if [[ -n "${PANEL_HIDDEN:-}" ]]; then
+            echo
+            echo "Панель закрыта снаружи. Открыть с компьютера:"
+            echo "  ssh -N -L ${PANEL_PORT}:127.0.0.1:${PANEL_PORT} root@${SERVER_IP}"
+            echo "  и в браузере: $(panel_local_url)   (предупреждение о сертификате — нормально)"
+        fi ;;
+    status)
+        if [[ -n "${PANEL_HIDDEN:-}" ]]; then echo "Панель закрыта снаружи (слушает только 127.0.0.1:${PANEL_PORT})"
+        else echo "Панель открыта снаружи: порт ${PANEL_PORT}/tcp"; fi ;;
+    hide)
+        if is_node; then echo "Это нода: главный сервер ходит в её панель по сети, закрывать нельзя."; exit 1; fi
+        [[ -z "${PANEL_HIDDEN:-}" ]] || { echo "Панель уже закрыта снаружи"; return; }
+        local all upd
+        all=$(api POST /setting/all); ok "$all"
+        upd=$(jq '.obj | .webListen = "127.0.0.1"' <<<"$all")
+        ok "$(api_json POST /setting/update "$upd")"
+        if command -v ufw >/dev/null; then ufw delete allow "${PANEL_PORT}/tcp" >/dev/null 2>&1 || true; fi
+        env_set PANEL_HIDDEN 1
+        echo "  Перезапускаю панель (VPN моргнёт на пару секунд)…"
+        restart_panel
+        wait_panel
+        echo "Панель закрыта снаружи: слушает только 127.0.0.1, порт ${PANEL_PORT} закрыт в ufw. Утилита vpn работает как раньше."
+        echo "Если у хостера есть свой фаервол, порт ${PANEL_PORT} там тоже можно закрыть."
+        echo "Открыть панель: ssh -N -L ${PANEL_PORT}:127.0.0.1:${PANEL_PORT} root@${SERVER_IP}, затем $(panel_local_url)"
+        echo "Вернуть как было: vpn panel show" ;;
+    show)
+        [[ -n "${PANEL_HIDDEN:-}" ]] || { echo "Панель и так открыта снаружи"; return; }
+        local all upd
+        all=$(api POST /setting/all); ok "$all"
+        upd=$(jq '.obj | .webListen = ""' <<<"$all")
+        ok "$(api_json POST /setting/update "$upd")"
+        if command -v ufw >/dev/null; then ufw allow "${PANEL_PORT}/tcp" comment 3x-ui-panel >/dev/null 2>&1 || true; fi
+        env_set PANEL_HIDDEN ""
+        restart_panel
+        wait_panel
+        echo "Панель снова открыта: ${PANEL_URL}" ;;
+    *) echo "Использование: vpn panel [hide|show|status]"; exit 1 ;;
+    esac
+}
+
 # ---------------------------------------------------------------- XHTTP и port hopping
 xhttp_id() { # XHTTP_ID; у старых установок — третий элемент INBOUNDS
     if [[ -n "${XHTTP_ID:-}" ]]; then echo "$XHTTP_ID"
@@ -1581,6 +1626,7 @@ r_fail() { echo -e "  ${c_r}[FAIL]${c_0} $*"; N_FAIL=$((N_FAIL + 1)); }
 listening() { local f=-ltn; [[ $2 == udp ]] && f=-lun; [[ -n "$(ss -H "$f" "sport = :$1" 2>/dev/null)" ]]; }
 
 do_check() {
+    local pp=$PANEL_PORT; [[ -z "${PANEL_HIDDEN:-}" ]] || pp=""   # закрытую снаружи панель не проверяем извне
     local external=${1:-yes} st r
     echo "Диагностика VPN ($(date '+%d.%m.%Y %H:%M'))"
 
@@ -1599,7 +1645,9 @@ do_check() {
     echo "— Порты на сервере"
     listening 443 tcp && r_ok "443/tcp слушается (VLESS)" || r_fail "443/tcp никто не слушает"
     listening 443 udp && r_ok "443/udp слушается (Hysteria2)" || r_fail "443/udp никто не слушает"
-    listening "$PANEL_PORT" tcp && r_ok "${PANEL_PORT}/tcp слушается (панель)" || r_fail "${PANEL_PORT}/tcp (панель) никто не слушает"
+    if [[ -n "${PANEL_HIDDEN:-}" ]]; then
+        listening "$PANEL_PORT" tcp && r_ok "Панель закрыта снаружи (127.0.0.1:${PANEL_PORT})" || r_fail "${PANEL_PORT}/tcp (панель) никто не слушает"
+    else listening "$PANEL_PORT" tcp && r_ok "${PANEL_PORT}/tcp слушается (панель)" || r_fail "${PANEL_PORT}/tcp (панель) никто не слушает"; fi
     listening "$SUB_PORT" tcp && r_ok "${SUB_PORT}/tcp слушается (подписки)" || r_fail "${SUB_PORT}/tcp (подписки) никто не слушает"
     if [[ -n "$(xhttp_id)" ]]; then
         listening "$XHTTP_PORT" tcp && r_ok "${XHTTP_PORT}/tcp слушается (VLESS XHTTP)" || r_fail "${XHTTP_PORT}/tcp (VLESS XHTTP) никто не слушает"
@@ -1616,7 +1664,7 @@ do_check() {
     fi
     if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
         local miss="" p s; s=$(ufw status)
-        for p in 80/tcp 443/tcp 443/udp "${PANEL_PORT}/tcp" "${SUB_PORT}/tcp" ${XHTTP_PORT:+"${XHTTP_PORT}/tcp"} ${H3_PORT:+"${H3_PORT}/udp"}; do grep -q "^${p} " <<<"$s" || miss+=" $p"; done
+        for p in 80/tcp 443/tcp 443/udp ${pp:+"${pp}/tcp"} "${SUB_PORT}/tcp" ${XHTTP_PORT:+"${XHTTP_PORT}/tcp"} ${H3_PORT:+"${H3_PORT}/udp"}; do grep -q "^${p} " <<<"$s" || miss+=" $p"; done
         [[ -z "$miss" ]] && r_ok "ufw: нужные порты открыты" || r_fail "ufw: не открыты:${miss} (ufw allow <порт>)"
     else
         r_warn "ufw выключен (работать будет, но сервер без фаервола)"
@@ -1788,7 +1836,7 @@ do_check() {
     if [[ "$external" == yes ]]; then
         echo "— Доступность снаружи (check-host.net)"
         local out port ru w ru_ok ru_all w_ok w_all name
-        if out=$(probe "$SERVER_IP" 443 ${XHTTP_PORT:+"$XHTTP_PORT"} "$SUB_PORT" "$PANEL_PORT" 80); then
+        if out=$(probe "$SERVER_IP" 443 ${XHTTP_PORT:+"$XHTTP_PORT"} "$SUB_PORT" ${pp:+"$pp"} 80); then
             while read -r port ru w; do
                 case "$port" in 443) name="443/tcp (VLESS)";; 80) name="80/tcp (продление сертификата)";;
                     "${XHTTP_PORT:-x}") name="${port}/tcp (VLESS XHTTP)";;
@@ -2092,7 +2140,7 @@ vpn renew <имя> <дней> [ГБ]              — продлить и обн
 vpn reset <имя>                          — обнулить трафик
 vpn off|on <имя>                         — отключить / включить
 vpn del <имя>                            — удалить
-vpn panel                                — адрес и логин панели
+vpn panel [hide|show|status]             — адрес и логин панели; hide — закрыть панель снаружи (доступ через ssh-туннель)
 vpn check [--local]                      — полная диагностика (--local: без проверки снаружи)
 vpn node                                 — ноды (другие серверы в этой же подписке): список
 vpn node add <адрес панели> <токен> [--name имя] — подключить сервер-ноду (адрес и токен: vpn node prepare на ноде)
@@ -2193,7 +2241,7 @@ off|on)
     echo "$1: $([[ $en == true ]] && echo включён || echo отключён)"
     ;;
 del) load_env; node_guard; check_name "${1:-}"; ok "$(api POST "/clients/del/$1")"; echo "Удалён: $1" ;;
-panel) cat /etc/vpn/panel.txt ;;
+panel) load_env; do_panel "$@" ;;
 check) load_env; if [[ "${1:-}" == --local ]]; then do_check no; else do_check yes; fi ;;
 *) usage ;;
 esac
