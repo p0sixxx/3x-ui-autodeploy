@@ -1186,7 +1186,7 @@ do_xhttp() {
         if listening "$port" tcp; then echo "Порт ${port}/tcp уже занят"; exit 1; fi
         rs=$(reality_settings)
         keys=$(api GET /server/getNewX25519Cert); ok "$keys"
-        name=$(inbound_remark "$(vless_id)"); name="${name% · VLESS} · XHTTP"
+        name="$(name_base "$(inbound_remark "$(vless_id)")") VLESS XHTTP"
         res=$(api_json POST /inbounds/add "$(jq -n --argjson port "$port" --argjson rs "$rs" --argjson k "$keys" \
             --arg sid "$(openssl rand -hex 8)" --arg path "/$(openssl rand -hex 6)" --arg host "$PUBLIC_HOST" --arg name "$name" '{
             remark: $name, enable: true, listen: "", port: $port, protocol: "vless", expiryTime: 0, total: 0,
@@ -1249,10 +1249,13 @@ h3_inbound_json() { # <порт> <домен> <путь> <название>
             settings: { allowInsecure: false, fingerprint: "chrome", echConfigList: "" } } },
         sniffing: { enabled: true, destOverride: ["http", "tls", "quic"], metadataOnly: false, routeOnly: true } }'
 }
+name_base() { # «🇫🇮 VLESS TCP», «NL · VLESS» → «🇫🇮», «NL»: имя сервера без названия протокола
+    sed -E 's/[[:space:]·-]*VLESS( TCP)?$//' <<<"$1"
+}
 h3_default_name() {
     local x
     if [[ -n "$(xhttp_id)" ]]; then x=$(inbound_remark "$(xhttp_id)"); echo "${x} HTTP3"; return; fi
-    x=$(inbound_remark "$(vless_id)"); echo "${x% · VLESS} · HTTP3"
+    x=$(inbound_remark "$(vless_id)"); echo "$(name_base "$x") VLESS XHTTP HTTP3"
 }
 do_http3() {
     local action=${1:-status}; [[ $# -gt 0 ]] && shift
@@ -1555,8 +1558,8 @@ do_brand() {
     done
     if [[ $auto == yes ]]; then
         local lbl; lbl=$(country_label)
-        vname="${lbl} · VLESS"; hname="${lbl} · Hysteria2"; [[ -n "$xname" ]] && xname="${lbl} · XHTTP"
-        [[ -n "$h3name" ]] && h3name="${lbl} · VLESS HTTP3"
+        vname="${lbl} · VLESS"; hname="${lbl} · Hysteria2"; [[ -n "$xname" ]] && xname="${lbl} · VLESS XHTTP"
+        [[ -n "$h3name" ]] && h3name="${lbl} · VLESS XHTTP HTTP3"
     fi
     if (( nflags == 0 )); then
         [[ -r /dev/tty ]] || { echo "Нет терминала — задай параметры флагами (vpn help)"; exit 1; }
@@ -1571,8 +1574,8 @@ do_brand() {
         [[ "$hname" == Hysteria2 || -z "$hname" ]] && hname="${lbl} · Hysteria2"
         vname=$(prompt_keep "Название сервера VLESS" "$vname")
         hname=$(prompt_keep "Название сервера Hysteria2" "$hname")
-        if [[ -n "$(xhttp_id)" ]]; then xname=$(prompt_keep "Название сервера XHTTP" "${xname:-${vname} · XHTTP}"); fi
-        if [[ -n "$(h3_id)" ]]; then h3name=$(prompt_keep "Название сервера HTTP3" "${h3name:-${vname} · HTTP3}"); fi
+        if [[ -n "$(xhttp_id)" ]]; then xname=$(prompt_keep "Название сервера XHTTP" "${xname:-$(name_base "$vname") VLESS XHTTP}"); fi
+        if [[ -n "$(h3_id)" ]]; then h3name=$(prompt_keep "Название сервера HTTP3" "${h3name:-$(name_base "$vname") VLESS XHTTP HTTP3}"); fi
     fi
     ann=${ann//\\n/$'\n'}
     [[ "$sup" == "-" ]] && sup=""
@@ -1653,7 +1656,7 @@ do_check() {
         listening "$XHTTP_PORT" tcp && r_ok "${XHTTP_PORT}/tcp слушается (VLESS XHTTP)" || r_fail "${XHTTP_PORT}/tcp (VLESS XHTTP) никто не слушает"
     fi
     if [[ -n "$(h3_id)" && -n "${H3_PORT:-}" ]]; then
-        listening "$H3_PORT" udp && r_ok "${H3_PORT}/udp слушается (VLESS HTTP3)" || r_fail "${H3_PORT}/udp (VLESS HTTP3) никто не слушает"
+        listening "$H3_PORT" udp && r_ok "${H3_PORT}/udp слушается (VLESS XHTTP HTTP3)" || r_fail "${H3_PORT}/udp (VLESS XHTTP HTTP3) никто не слушает"
     fi
     if [[ -n "${HOP_PORTS:-}" ]]; then
         if iptables -t nat -C PREROUTING -p udp --dport "${HOP_PORTS/-/:}" -j REDIRECT --to-ports 443 2>/dev/null; then
@@ -1728,8 +1731,8 @@ do_check() {
             [[ -n "$xh" ]] && r_ok "Подписка содержит VLESS XHTTP" || r_fail "В подписке нет ссылки VLESS XHTTP"
         fi
         if [[ -n "$(h3_id)" ]]; then
-            if [[ -n "$h3" ]] && grep -q 'alpn=h3' <<<"$h3"; then r_ok "Подписка содержит VLESS HTTP3 (alpn h3)"
-            else r_fail "В подписке нет ссылки VLESS HTTP3 с alpn=h3"; fi
+            if [[ -n "$h3" ]] && grep -q 'alpn=h3' <<<"$h3"; then r_ok "Подписка содержит VLESS XHTTP HTTP3 (alpn h3)"
+            else r_fail "В подписке нет ссылки VLESS XHTTP HTTP3 с alpn=h3"; fi
         fi
         if [[ -n "${HOP_PORTS:-}" ]]; then
             grep -q "mport=" <<<"$hy" && r_ok "В ссылке Hysteria2 есть диапазон портов (mport)" || r_fail "В ссылке Hysteria2 нет mport"
@@ -1808,8 +1811,8 @@ do_check() {
     fi
     if [[ -n "${h3:-}" ]]; then
         ip_out=$(e2e "$h3" 10875)
-        [[ -n "$ip_out" ]] && r_ok "VLESS HTTP3 (QUIC) работает, выход в интернет с IP ${ip_out}" \
-            || r_fail "VLESS HTTP3: клиент не смог выйти в интернет через сервер (открыт ли ${H3_PORT:-?}/udp у хостера?)"
+        [[ -n "$ip_out" ]] && r_ok "VLESS XHTTP HTTP3 (QUIC) работает, выход в интернет с IP ${ip_out}" \
+            || r_fail "VLESS XHTTP HTTP3: клиент не смог выйти в интернет через сервер (открыт ли ${H3_PORT:-?}/udp у хостера?)"
     fi
     if [[ -n "${vl:-}" ]]; then
         ip_out=$(e2e "$vl" 10871)

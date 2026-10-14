@@ -194,7 +194,7 @@ vpn brand --title "p0six KVN" --announce 'Привет, {{EMAIL}}\nОплата 
           --support @admin --site подписка
 
 vpn brand --vless-name "FIN - VLESS TCP" --xhttp-name "FIN - VLESS XHTTP" --hy2-name "FIN - Hysteria2"
-vpn brand --http3-name "FIN - VLESS HTTP3"     # если включён сервер HTTP3
+vpn brand --http3-name "FIN - VLESS XHTTP HTTP3"     # если включён сервер HTTP3
 ```
 
 Флаги можно указывать в любом наборе: остальные значения не меняются. После `vpn brand` панель перезапускается, VPN пропадает на пару секунд. Затем в клиентах нужно нажать «Обновить подписку».
@@ -272,7 +272,7 @@ vpn hop off
 
 ```
 vpn reality self cdn.домен.tech                 # один раз: свой домен и сертификат
-vpn http3 on 4443 --name "🇫🇮 VLESS HTTP3"      # включить (порт и название можно не указывать)
+vpn http3 on 4443 --name "🇫🇮 VLESS XHTTP HTTP3"      # включить (порт и название можно не указывать)
 vpn http3                                       # статус
 vpn http3 off                                   # выключить
 ```
