@@ -16,7 +16,10 @@
 #   SUPPORT_URL=@username      — кнопка «Поддержка» (ссылка или @username в Telegram)
 #   ACME_EMAIL                 — e-mail для Let's Encrypt
 #   PROTOCOLS=vless,hy2,xhttp  — какие серверы создать: vless (VLESS TCP + Reality, 443/tcp), hy2 (Hysteria2, 443/udp),
-#                                xhttp (VLESS XHTTP + Reality, 8443/tcp). Не задано: спросит в терминале (Enter — все три)
+#                                xhttp (VLESS XHTTP + Reality, 8443/tcp), http3 (VLESS XHTTP по HTTP/3, 4443/udp; нужен SELF_DOMAIN
+#                                и vless или xhttp). Не задано: спросит в терминале (Enter — vless, hy2, xhttp)
+#   SELF_DOMAIN=cdn.example.com — свой домен (A-запись → сервер): Reality получает SNI = домен и сайт-заглушку
+#                                с сертификатом Let's Encrypt (как vpn reality self); обязателен для http3
 #   XHTTP_PORT=8443            — порт сервера VLESS + XHTTP + Reality (0 — не создавать)
 #   HOP_PORTS=20000-50000      — включить port hopping для Hysteria2 (по умолчанию выключен)
 #   FASTEST=0                  — не создавать сервер «Самый быстрый» (по умолчанию создаётся)
@@ -232,24 +235,45 @@ choose_protocols() { # → P_VLESS, P_HY2, P_XHTTP (0/1); PROTOCOLS=vless,hy2,xh
             echo "      1) VLESS TCP + Reality         443/tcp   основной, работает почти везде"
             echo "      2) Hysteria2                   443/udp   быстрый, по UDP (если оператор режет TCP)"
             echo "      3) VLESS XHTTP + Reality       ${XHTTP_PORT:-8443}/tcp   лучше переносит «заморозку» TCP"
+            echo "      4) VLESS XHTTP по HTTP/3       4443/udp  QUIC, когда глушат TCP. ТРЕБУЕТСЯ СВОЙ ДОМЕН (A-запись на этот"
+            echo "                                                сервер) и ещё один из пунктов 1 или 3; домен спросим дальше"
             read -r -p "    Номера через пробел или запятую [1 2 3]: " a || true
             [[ -n "$a" ]] && sel=$a
+            if [[ " ${a//,/ } " == *" 4 "* && -z "${SELF_DOMAIN:-}" ]]; then
+                read -r -p "    Домен для HTTP/3 и Reality (A-запись должна указывать на ${SERVER_IP}), например cdn.example.com: " SELF_DOMAIN || true
+            fi
         fi
     fi
-    P_VLESS=0; P_HY2=0; P_XHTTP=0
+    P_VLESS=0; P_HY2=0; P_XHTTP=0; P_H3=0
     for t in $(tr ',;' '  ' <<<"${sel,,}"); do
         case "$t" in
             1|vless|tcp|reality) P_VLESS=1;;
             2|hy2|hysteria|hysteria2) P_HY2=1;;
             3|xhttp) P_XHTTP=1;;
+            4|http3|h3) P_H3=1;;
             all|все) P_VLESS=1; P_HY2=1; P_XHTTP=1;;
-            *) die "Неизвестный протокол «$t». Допустимо: vless, hy2, xhttp (через запятую) или номера 1 2 3";;
+            *) die "Неизвестный протокол «$t». Допустимо: vless, hy2, xhttp, http3 (через запятую) или номера 1 2 3 4";;
         esac
     done
     [[ "${XHTTP_PORT:-}" == 0 ]] && P_XHTTP=0
-    (( P_VLESS + P_HY2 + P_XHTTP > 0 )) || die "Не выбран ни один протокол"
+    (( P_VLESS + P_HY2 + P_XHTTP + P_H3 > 0 )) || die "Не выбран ни один протокол"
     (( P_XHTTP )) || XHTTP_PORT=0
-    ok "Серверы: $( ((P_VLESS)) && echo -n 'VLESS TCP ' )$( ((P_HY2)) && echo -n 'Hysteria2 ' )$( ((P_XHTTP)) && echo -n 'VLESS XHTTP' )"
+    if (( P_H3 )); then
+        (( P_VLESS || P_XHTTP )) || die "HTTP/3 строится на Reality-сервере: выбери ещё vless или xhttp"
+        [[ -n "${SELF_DOMAIN:-}" ]] || die "Для HTTP/3 нужен свой домен: SELF_DOMAIN=cdn.example.com (A-запись → ${SERVER_IP})"
+    fi
+    if [[ -n "${SELF_DOMAIN:-}" ]]; then
+        SELF_DOMAIN=${SELF_DOMAIN,,}
+        [[ "$SELF_DOMAIN" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$ ]] || die "SELF_DOMAIN='$SELF_DOMAIN' не похож на домен"
+        (( P_VLESS || P_XHTTP )) || { warn "SELF_DOMAIN нужен Reality-серверу (vless или xhttp), а их нет: домен пропускаю"; SELF_DOMAIN=""; }
+    fi
+    if [[ -n "${SELF_DOMAIN:-}" ]]; then
+        local dips; dips=$( { getent ahostsv4 "$SELF_DOMAIN" 2>/dev/null || true; } | awk '{print $1}' | sort -u | xargs)
+        [[ " $dips " == *" ${SERVER_IP} "* ]] \
+            || die "A-запись $SELF_DOMAIN указывает на «${dips:-ничего}», а не на ${SERVER_IP}. Исправь её у регистратора, подожди 5–15 минут и запусти снова."
+        ok "Домен $SELF_DOMAIN → ${SERVER_IP}"
+    fi
+    ok "Серверы: $( ((P_VLESS)) && echo -n 'VLESS TCP ' )$( ((P_HY2)) && echo -n 'Hysteria2 ' )$( ((P_XHTTP)) && echo -n 'VLESS XHTTP ' )$( ((P_H3)) && echo -n 'VLESS XHTTP HTTP3' )"
 }
 
 choose_params() {
@@ -2322,10 +2346,24 @@ VPNCLI
 }
 
 # =========================================================================== итог
+setup_self_domain() { # SELF_DOMAIN: Reality на свой домен, при выборе http3 — ещё и сервер HTTP3
+    [[ -n "${SELF_DOMAIN:-}" ]] || return 0
+    local bad=0
+    vpn reality self "$SELF_DOMAIN" 2>&1 | sed 's/^/    /' || bad=1
+    if (( bad )); then
+        warn "Reality на домен $SELF_DOMAIN не настроился (подробности выше). Повтори позже: vpn reality self $SELF_DOMAIN"
+        return 0
+    fi
+    if (( ${P_H3:-0} )); then
+        vpn http3 on 2>&1 | sed 's/^/    /' || warn "HTTP3 не включился. Повтори позже: vpn http3 on"
+    fi
+}
+
 finish_node() {
     log "Готовлю сервер как ноду и проверяю"
     if [[ "$XHTTP_PORT" != 0 ]]; then vpn xhttp on "$XHTTP_PORT" | sed 's/^/    /'; fi
     if [[ -n "${HOP_PORTS:-}" ]]; then vpn hop on "$HOP_PORTS" | sed 's/^/    /'; fi
+    setup_self_domain
     local rc=0
     ( umask 077; vpn node prepare --yes > "$VPN_DIR/node-add.txt" )
     vpn check | tee "$VPN_DIR/check-install.txt" || rc=$?
@@ -2344,6 +2382,7 @@ finish() {
     log "Создаю твоего пользователя и проверяю всё целиком"
     if [[ "$XHTTP_PORT" != 0 ]]; then vpn xhttp on "$XHTTP_PORT" | sed 's/^/    /'; fi
     if [[ -n "${HOP_PORTS:-}" ]]; then vpn hop on "$HOP_PORTS" | sed 's/^/    /'; fi
+    setup_self_domain
     if [[ "${FASTEST:-1}" != 0 ]]; then
         if (( $(sed -n "s/^INBOUNDS='\(.*\)'/\1/p" "$VPN_DIR/vpn.env" | jq length) >= 2 )); then vpn fastest on | sed 's/^/    /'
         else echo "    «Самый быстрый» не создаю: сервер один (добавится, когда появится второй: vpn fastest on)"; fi
