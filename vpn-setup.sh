@@ -2232,6 +2232,7 @@ vpn devices <имя> [reset|<номер>]        — устройства пол
 vpn list                                 — все пользователи, трафик, сроки
 vpn link <имя>                           — ссылка подписки + QR
 vpn renew <имя> <дней> [ГБ]              — продлить и обнулить трафик (ГБ — новый лимит)
+vpn expire <имя> <дней>                  — задать срок «N дней от сегодня» (0 — бессрочно), трафик не трогает
 vpn reset <имя>                          — обнулить трафик
 vpn off|on <имя>                         — отключить / включить
 vpn del <имя>                            — удалить
@@ -2328,6 +2329,16 @@ renew)
     if [[ "$exp" == 0 ]]; then until_s="бессрочно"; else until_s="до $(date -d "@$(( exp / 1000 ))" '+%d.%m.%Y %H:%M')"; fi
     echo "Продлён: $1, ${until_s}, трафик обнулён"
     if (( exp > 0 && exp < $(now_ms) )); then echo "Внимание: срок уже истёк — пользователь не подключится. Продли на N дней: vpn renew $1 30"; fi
+    ;;
+expire)
+    load_env; node_guard
+    [[ $# -ge 2 ]] || { usage; exit 1; }
+    check_name "$1"; is_num "$2" || { echo "Дни — число (0 — бессрочно)"; exit 1; }
+    c=$(get_client "$1")
+    if (( ${2%.*} == 0 )); then exp=0; else exp=$(( $(now_ms) + ${2%.*} * 86400000 )); fi
+    save_client "$(jq --argjson exp "$exp" '.expiryTime = $exp | .enable = true' <<<"$c")"
+    if [[ "$exp" == 0 ]]; then echo "$1: бессрочно (трафик не тронут)"
+    else echo "$1: срок до $(date -d "@$(( exp / 1000 ))" '+%d.%m.%Y %H:%M') (трафик не тронут). Клиенты покажут дату после обновления подписки"; fi
     ;;
 reset) load_env; node_guard; check_name "${1:-}"; ok "$(api POST "/clients/resetTraffic/$1")"; echo "Трафик $1 обнулён" ;;
 off|on)
