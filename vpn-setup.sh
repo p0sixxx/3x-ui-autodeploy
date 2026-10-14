@@ -235,8 +235,7 @@ choose_protocols() { # → P_VLESS, P_HY2, P_XHTTP (0/1); PROTOCOLS=vless,hy2,xh
             echo "      1) VLESS TCP + Reality         443/tcp   основной, работает почти везде"
             echo "      2) Hysteria2                   443/udp   быстрый, по UDP (если оператор режет TCP)"
             echo "      3) VLESS XHTTP + Reality       ${XHTTP_PORT:-8443}/tcp   лучше переносит «заморозку» TCP"
-            echo "      4) VLESS XHTTP по HTTP/3       4443/udp  QUIC, когда глушат TCP. ТРЕБУЕТСЯ СВОЙ ДОМЕН (A-запись на этот"
-            echo "                                                сервер) и ещё один из пунктов 1 или 3; домен спросим дальше"
+            echo "      4) VLESS XHTTP по HTTP/3       4443/udp  QUIC, когда глушат TCP (нужен свой домен и пункт 1 или 3)"
             read -r -p "    Номера через пробел или запятую [1 2 3]: " a || true
             [[ -n "$a" ]] && sel=$a
             if [[ " ${a//,/ } " == *" 4 "* && -z "${SELF_DOMAIN:-}" ]]; then
