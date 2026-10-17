@@ -1640,6 +1640,11 @@ do_brand() {
     [[ -n "$(hy2_id)" ]] && hname=$(inbound_remark "$(hy2_id)")
     local xname=""; [[ -n "$(xhttp_id)" ]] && xname=$(inbound_remark "$(xhttp_id)")
     local h3name=""; [[ -n "$(h3_id)" ]] && h3name=$(inbound_remark "$(h3_id)")
+    # баннер со своей кнопкой: в INCY (Banner-*) и в Happ (Sub-Info-*), другим клиентам не отправляется
+    local btext bbtn burl bset=0
+    btext=$(jq -r '.obj.subIncyBannerText // ""' <<<"$all")
+    bbtn=$(jq -r '.obj.subIncyBannerButtonText // ""' <<<"$all")
+    burl=$(jq -r '.obj.subIncyBannerButtonUrl // ""' <<<"$all")
     local nflags=$#
     while [[ $# -gt 0 ]]; do
         a=$1; shift
@@ -1653,8 +1658,13 @@ do_brand() {
             --xhttp-name) xname=${1:-}; shift ;;
             --http3-name) h3name=${1:-}; shift ;;
             --auto-names) auto=yes ;;
+            --banner) btext=${1:-}; shift; bset=1 ;;
+            --banner-button) bbtn=${1:-}; shift; bset=1 ;;
+            --banner-url) burl=${1:-}; shift; bset=1 ;;
             --show) echo "Название:   ${title}"; echo "Описание:   ${ann//$'\n'/ ⏎ }"; echo "Поддержка:  ${sup:--}"
-                    echo "Сайт:       ${site}"; local names; names=$(printf '%s\n' "$vname" "$hname" "$xname" "$h3name" | awk 'NF' | paste -sd'|' | sed 's/|/ | /g')
+                    echo "Сайт:       ${site}"
+                    if [[ -n "$btext" ]]; then echo "Баннер:     ${btext//$'\n'/ ⏎ }${bbtn:+ [кнопка «${bbtn}» → ${burl}]} (INCY, Happ)"; else echo "Баннер:     -"; fi
+                    local names; names=$(printf '%s\n' "$vname" "$hname" "$xname" "$h3name" | awk 'NF' | paste -sd'|' | sed 's/|/ | /g')
                     echo "Серверы:    ${names}"; return ;;
             *) echo "Неизвестный параметр: $a (см. vpn help)"; exit 1 ;;
         esac
@@ -1687,6 +1697,17 @@ do_brand() {
         if [[ -n "$(h3_id)" ]]; then h3name=$(prompt_keep "Название сервера HTTP3" "${h3name:-$(name_base "${vname:-$hname}") · VLESS XHTTP HTTP3}"); fi
     fi
     ann=${ann//\\n/$'\n'}
+    if (( bset )); then
+        if [[ "$btext" == "-" ]]; then btext=""; bbtn=""; burl=""; fi
+        [[ "$bbtn" == "-" ]] && bbtn=""
+        [[ "$burl" == "-" ]] && burl=""
+        btext=${btext//\\n/$'\n'}
+        [[ -z "$burl" ]] || burl=$(norm_support "$burl")
+        if [[ -z "$btext" && ( -n "$bbtn" || -n "$burl" ) ]]; then echo "У баннера нет текста: задай --banner \"текст\""; exit 1; fi
+        if [[ -n "$bbtn" && -z "$burl" ]]; then echo "Для кнопки баннера нужна ссылка: --banner-url https://… или @username"; exit 1; fi
+        if [[ -n "$burl" && ! "$burl" =~ ^https?:// ]]; then echo "Ссылка кнопки баннера должна начинаться с https:// (или @username для Telegram)"; exit 1; fi
+        if [[ -n "$burl" && -z "$bbtn" ]]; then bbtn="Открыть"; fi
+    fi
     [[ "$sup" == "-" ]] && sup=""
     sup=$(norm_support "$sup")
     (( ${#ann} <= 200 )) || echo "Внимание: описание длиннее 200 символов — некоторые клиенты его обрежут."
@@ -1700,6 +1721,12 @@ do_brand() {
     upd=$(jq --arg t "$title" --arg a "$ann" --arg s "$sup" --arg m "$mode" --arg u "$url" '.obj
         | .subTitle = $t | .subAnnounce = $a | .subSupportUrl = $s | .subProfileMode = $m | .subProfileUrl = $u
         | .remarkTemplate = "{{INBOUND}}"' <<<"$all")
+    if (( bset )); then
+        upd=$(jq --arg t "$btext" --arg b "$bbtn" --arg u "$burl" '
+            .subIncyBannerText = $t | .subIncyBannerButtonText = $b | .subIncyBannerButtonUrl = $u
+            | .subHappSubInfoText = $t | .subHappSubInfoButtonText = $b | .subHappSubInfoButtonLink = $u
+            | if $t != "" then .subIncyAppAutoDetect = true | .subHappAutoDetect = true else . end' <<<"$upd")
+    fi
     ok "$(api_json POST /setting/update "$upd")"
     if [[ -n "$(vless_id)" && -n "$vname" ]]; then inbound_patch "$(vless_id)" '.remark = $n' --arg n "$vname"; fi
     if [[ -n "$(hy2_id)" && -n "$hname" ]]; then inbound_patch "$(hy2_id)" '.remark = $n' --arg n "$hname"; fi
@@ -2629,6 +2656,8 @@ vpn brand                                — подпись подписки и 
 vpn brand --show                         — показать текущие
 vpn brand [--title Т] [--announce Т] [--support @user|URL|-] [--site URL|подписка|-]
           [--vless-name Т] [--hy2-name Т] [--xhttp-name Т] [--http3-name Т] [--auto-names] — то же флагами
+vpn brand --banner "текст" [--banner-button "Текст кнопки"] [--banner-url https://…|@user] | --banner -
+                                         — баннер со своей кнопкой в INCY и Happ (- — убрать)
 vpn xhttp on [порт] | off                — доп. сервер VLESS + XHTTP + Reality (по умолчанию порт 8443)
 vpn http3 on [порт] [--name Т] | off     — доп. сервер VLESS + XHTTP по HTTP/3 (QUIC, UDP) на своём домене
                                            (нужен vpn reality self; по умолчанию порт 4443/udp)
