@@ -1640,7 +1640,8 @@ do_brand() {
     [[ -n "$(hy2_id)" ]] && hname=$(inbound_remark "$(hy2_id)")
     local xname=""; [[ -n "$(xhttp_id)" ]] && xname=$(inbound_remark "$(xhttp_id)")
     local h3name=""; [[ -n "$(h3_id)" ]] && h3name=$(inbound_remark "$(h3_id)")
-    # баннер со своей кнопкой: в INCY (Banner-*) и в Happ (Sub-Info-*), другим клиентам не отправляется
+    # баннер со своей кнопкой: INCY (Banner-*); Happ (Sub-Info-*) — только если в панели включено управление Happ,
+    # оно заодно шлёт Happ свои Routing-Enable/Hide-Settings, поэтому само не включается
     local btext bbtn burl bset=0
     btext=$(jq -r '.obj.subIncyBannerText // ""' <<<"$all")
     bbtn=$(jq -r '.obj.subIncyBannerButtonText // ""' <<<"$all")
@@ -1663,7 +1664,7 @@ do_brand() {
             --banner-url) burl=${1:-}; shift; bset=1 ;;
             --show) echo "Название:   ${title}"; echo "Описание:   ${ann//$'\n'/ ⏎ }"; echo "Поддержка:  ${sup:--}"
                     echo "Сайт:       ${site}"
-                    if [[ -n "$btext" ]]; then echo "Баннер:     ${btext//$'\n'/ ⏎ }${bbtn:+ [кнопка «${bbtn}» → ${burl}]} (INCY, Happ)"; else echo "Баннер:     -"; fi
+                    if [[ -n "$btext" ]]; then echo "Баннер:     ${btext//$'\n'/ ⏎ }${bbtn:+ [кнопка «${bbtn}» → ${burl}]} (INCY)"; else echo "Баннер:     -"; fi
                     local names; names=$(printf '%s\n' "$vname" "$hname" "$xname" "$h3name" | awk 'NF' | paste -sd'|' | sed 's/|/ | /g')
                     echo "Серверы:    ${names}"; return ;;
             *) echo "Неизвестный параметр: $a (см. vpn help)"; exit 1 ;;
@@ -1725,7 +1726,7 @@ do_brand() {
         upd=$(jq --arg t "$btext" --arg b "$bbtn" --arg u "$burl" '
             .subIncyBannerText = $t | .subIncyBannerButtonText = $b | .subIncyBannerButtonUrl = $u
             | .subHappSubInfoText = $t | .subHappSubInfoButtonText = $b | .subHappSubInfoButtonLink = $u
-            | if $t != "" then .subIncyAppAutoDetect = true | .subHappAutoDetect = true else . end' <<<"$upd")
+            | if $t != "" then .subIncyAppAutoDetect = true else . end' <<<"$upd")
     fi
     ok "$(api_json POST /setting/update "$upd")"
     if [[ -n "$(vless_id)" && -n "$vname" ]]; then inbound_patch "$(vless_id)" '.remark = $n' --arg n "$vname"; fi
