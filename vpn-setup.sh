@@ -1468,6 +1468,9 @@ UNIT
 # ---------------------------------------------------------------- «Самый быстрый» (балансировщик в JSON-подписке)
 FASTEST_DEFAULT_NAME="⚡ Самый быстрый"
 FASTEST_DEFAULT_CLIENTS="happ,v2raytun,incy"
+# Проверка серверов клиентом (burstObservatory): цикл = interval × sampling; сервер считается упавшим после 1–2 циклов
+# подряд неудачных проверок, то есть переключение занимает от одного до двух циклов. Минимум interval — 10s.
+FASTEST_DEF_INTERVAL=10s; FASTEST_DEF_SAMPLING=2; FASTEST_DEF_TIMEOUT=4s
 FASTEST_UA_PROBE="Happ/3.1.2"
 clients_regex() { # happ,v2raytun → (?i)\b(happ|v2raytun)\b
     echo "(?i)\\b($(tr ',' '|' <<<"$1"))\\b"
@@ -1511,26 +1514,35 @@ fastest_settings() { # <on|off> <clients>
     if [[ $1 == on ]]; then
         upd=$(jq --arg re "$(clients_regex "$2")" '.obj | .subJsonEnable = true | .subJsonAutoDetect = true
             | .subJsonUserAgentRegex = $re | .subJsonAlwaysArray = true
-            | .subJsonObservatory = "{\"interval\":\"30s\",\"sampling\":2,\"timeout\":\"5s\"}"' <<<"$all")
+            | .subJsonObservatory = $obs' --arg obs "$(jq -nc --arg i "${FASTEST_INTERVAL:-$FASTEST_DEF_INTERVAL}" \
+                --argjson n "${FASTEST_SAMPLING:-$FASTEST_DEF_SAMPLING}" --arg t "${FASTEST_TIMEOUT:-$FASTEST_DEF_TIMEOUT}" \
+                '{interval: $i, sampling: $n, timeout: $t}')" <<<"$all")
     else
         upd=$(jq '.obj | .subJsonAutoDetect = false' <<<"$all")
     fi
     ok "$(api_json POST /setting/update "$upd")"
 }
 do_fastest() {
-    local action=${1:-} name="" clients="" a args=() r
+    local action=${1:-} name="" clients="" a args=() r obs_i="" obs_n="" obs_t=""
     [[ $# -gt 0 ]] && shift
     while [[ $# -gt 0 ]]; do
         a=$1; shift
         case "$a" in
             --name) name=${1:-}; shift ;;
             --clients) clients=$(tr 'A-Z' 'a-z' <<<"${1:-}" | tr -d ' '); shift ;;
+            --interval) obs_i=${1:-}; shift ;;
+            --sampling) obs_n=${1:-}; shift ;;
+            --timeout) obs_t=${1:-}; shift ;;
             *) echo "Неизвестный параметр: $a"; exit 1 ;;
         esac
     done
     if [[ -n "$clients" && ! "$clients" =~ ^[a-z0-9-]+(,[a-z0-9-]+)*$ ]]; then
         echo "--clients: список через запятую, например happ,v2raytun,incy"; exit 1
     fi
+    if [[ -n "$obs_i" ]]; then [[ "$obs_i" =~ ^([0-9]+)s$ ]] && (( ${BASH_REMATCH[1]} >= 10 )) || { echo "--interval: секунды не меньше 10, например 10s"; exit 1; }; fi
+    if [[ -n "$obs_n" ]]; then [[ "$obs_n" =~ ^[0-9]+$ ]] && (( obs_n >= 1 && obs_n <= 10 )) || { echo "--sampling: число от 1 до 10"; exit 1; }; fi
+    if [[ -n "$obs_t" ]]; then [[ "$obs_t" =~ ^([0-9]+)s$ ]] && (( ${BASH_REMATCH[1]} >= 1 && ${BASH_REMATCH[1]} <= 30 )) || { echo "--timeout: секунды от 1 до 30, например 4s"; exit 1; }; fi
+    if [[ -n "$obs_i$obs_n$obs_t" && "$action" != on ]]; then echo "--interval, --sampling и --timeout задаются вместе с on: vpn fastest on --interval 10s"; exit 1; fi
     case "$action" in
     on)
         (( $(jq length <<<"$INBOUNDS") >= 2 )) || { echo "«Самый быстрый» выбирает из нескольких серверов, а сейчас он один. Добавь ещё: vpn xhttp on (или Hysteria2/нода)"; exit 1; }
@@ -1546,6 +1558,12 @@ do_fastest() {
         fi
         fastest_sync
         env_set FASTEST_CLIENTS "$clients"
+        [[ -z "$obs_i" ]] || env_set FASTEST_INTERVAL "$obs_i"
+        [[ -z "$obs_n" ]] || env_set FASTEST_SAMPLING "$obs_n"
+        [[ -z "$obs_t" ]] || env_set FASTEST_TIMEOUT "$obs_t"
+        env_set FASTEST_INTERVAL "${FASTEST_INTERVAL:-$FASTEST_DEF_INTERVAL}"
+        env_set FASTEST_SAMPLING "${FASTEST_SAMPLING:-$FASTEST_DEF_SAMPLING}"
+        env_set FASTEST_TIMEOUT "${FASTEST_TIMEOUT:-$FASTEST_DEF_TIMEOUT}"
         fastest_settings on "$clients"
         echo "Перезапускаю панель (VPN моргнёт на пару секунд)…"
         restart_panel
@@ -1565,8 +1583,10 @@ do_fastest() {
         r=$(api GET /sub-balancers | jq -c --argjson id "$FASTEST_ID" '.obj[]? | select(.id == $id)')
         echo "«$(jq -r .remark <<<"$r")» включён: выбирает самый быстрый из серверов ($(jq -r '.inboundIds | length' <<<"$r") шт.)"
         echo "Получают его клиенты: ${FASTEST_CLIENTS:-$FASTEST_DEFAULT_CLIENTS} (остальные — обычные ссылки)"
+        local oi=${FASTEST_INTERVAL:-30s} on_=${FASTEST_SAMPLING:-2} ot=${FASTEST_TIMEOUT:-5s}
+        echo "Проверка серверов: interval ${oi}, sampling ${on_}, timeout ${ot}; упавший сервер снимается через $(( ${oi%s} * on_ ))–$(( ${oi%s} * on_ * 2 )) с"
         ;;
-    *) echo "vpn fastest [on|off|status] [--name Т] [--clients happ,v2raytun,incy]"; exit 1 ;;
+    *) echo "vpn fastest [on|off|status] [--name Т] [--clients happ,v2raytun,incy] [--interval 10s] [--sampling 2] [--timeout 4s]"; exit 1 ;;
     esac
 }
 
@@ -2257,7 +2277,7 @@ vpn xhttp on [порт] | off                — доп. сервер VLESS + XH
 vpn http3 on [порт] [--name Т] | off     — доп. сервер VLESS + XHTTP по HTTP/3 (QUIC, UDP) на своём домене
                                            (нужен vpn reality self; по умолчанию порт 4443/udp)
 vpn hop on [от-до] | off                 — port hopping для Hysteria2 (по умолчанию UDP 20000-50000)
-vpn fastest on|off|status [--name Т] [--clients happ,v2raytun,incy]
+vpn fastest on|off|status [--name Т] [--clients happ,v2raytun,incy] [--interval 10s] [--sampling 2] [--timeout 4s]
                                          — сервер «Самый быстрый»: сам выбирает лучший протокол
                                            (только в клиентах из списка, остальные получают обычные ссылки)
 vpn help                                 — эта справка
