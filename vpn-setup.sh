@@ -2657,8 +2657,10 @@ vpn brand                                — подпись подписки и 
 vpn brand --show                         — показать текущие
 vpn brand [--title Т] [--announce Т] [--support @user|URL|-] [--site URL|подписка|-]
           [--vless-name Т] [--hy2-name Т] [--xhttp-name Т] [--http3-name Т] [--auto-names] — то же флагами
+                                           (@user → https://t.me/user; «-» — убрать кнопку; подписи кнопок
+                                           «Поддержка» и «Сайт» рисует клиент, их не поменять)
 vpn brand --banner "текст" [--banner-button "Текст кнопки"] [--banner-url https://…|@user] | --banner -
-                                         — баннер со своей кнопкой в INCY и Happ (- — убрать)
+                                         — баннер со своей кнопкой в INCY (ссылка одна на всех; - — убрать)
 vpn xhttp on [порт] | off                — доп. сервер VLESS + XHTTP + Reality (по умолчанию порт 8443)
 vpn http3 on [порт] [--name Т] | off     — доп. сервер VLESS + XHTTP по HTTP/3 (QUIC, UDP) на своём домене
                                            (нужен vpn reality self; по умолчанию порт 4443/udp)
