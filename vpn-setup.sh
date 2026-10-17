@@ -1357,7 +1357,7 @@ do_http3() {
         fi
         # 3x-ui считает XHTTP «tcp»-инбаундом и не даёт два инбаунда на одном номере порта
         local busy
-        busy=$(api GET /inbounds/list | jq -r --argjson p "$port" '.obj[]? | select(.port == $p) | .remark' | head -1)
+        busy=$(api GET /inbounds/list | jq -r --argjson p "$port" '.obj[]? | select(.port == $p and .nodeId == null) | .remark' | head -1)
         if [[ -n "$busy" || "$port" == "${PANEL_PORT:-}" || "$port" == "${SUB_PORT:-}" ]]; then
             echo "Порт ${port} уже занят${busy:+ сервером «$busy»} (панель 3x-ui не даёт два сервера на одном номере порта). Укажи другой: vpn http3 on <порт>"; exit 1
         fi
