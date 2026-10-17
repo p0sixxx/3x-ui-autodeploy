@@ -1264,7 +1264,7 @@ do_xhttp() {
         if [[ -n "$(reality_id)" ]]; then rs=$(reality_settings)
         else rs=$(jq -nc --arg t "${RT_TARGET:-www.samsung.com:443}" --arg s "${RT_SNI:-www.samsung.com}" '{target: $t, serverNames: [$s]}'); fi
         keys=$(api GET /server/getNewX25519Cert); ok "$keys"
-        name="$(name_base "$(inbound_remark "$(ref_id)")") VLESS XHTTP"
+        name="$(name_base "$(inbound_remark "$(ref_id)")") · VLESS XHTTP"
         res=$(api_json POST /inbounds/add "$(jq -n --argjson port "$port" --argjson rs "$rs" --argjson k "$keys" \
             --arg sid "$(openssl rand -hex 8)" --arg path "/$(openssl rand -hex 6)" --arg host "$PUBLIC_HOST" --arg name "$name" '{
             remark: $name, enable: true, listen: "", port: $port, protocol: "vless", expiryTime: 0, total: 0,
@@ -1333,7 +1333,7 @@ name_base() { # «🇫🇮 VLESS TCP», «NL · VLESS», «🇫🇮 Hysteria2» 
 h3_default_name() {
     local x
     if [[ -n "$(xhttp_id)" ]]; then x=$(inbound_remark "$(xhttp_id)"); echo "${x} HTTP3"; return; fi
-    x=$(inbound_remark "$(ref_id)"); echo "$(name_base "$x") VLESS XHTTP HTTP3"
+    x=$(inbound_remark "$(ref_id)"); echo "$(name_base "$x") · VLESS XHTTP HTTP3"
 }
 do_http3() {
     local action=${1:-status}; [[ $# -gt 0 ]] && shift
@@ -1683,8 +1683,8 @@ do_brand() {
             [[ "$hname" == Hysteria2 || -z "$hname" ]] && hname="${lbl} · Hysteria2"
             hname=$(prompt_keep "Название сервера Hysteria2" "$hname")
         fi
-        if [[ -n "$(xhttp_id)" ]]; then xname=$(prompt_keep "Название сервера XHTTP" "${xname:-$(name_base "${vname:-$hname}") VLESS XHTTP}"); fi
-        if [[ -n "$(h3_id)" ]]; then h3name=$(prompt_keep "Название сервера HTTP3" "${h3name:-$(name_base "${vname:-$hname}") VLESS XHTTP HTTP3}"); fi
+        if [[ -n "$(xhttp_id)" ]]; then xname=$(prompt_keep "Название сервера XHTTP" "${xname:-$(name_base "${vname:-$hname}") · VLESS XHTTP}"); fi
+        if [[ -n "$(h3_id)" ]]; then h3name=$(prompt_keep "Название сервера HTTP3" "${h3name:-$(name_base "${vname:-$hname}") · VLESS XHTTP HTTP3}"); fi
     fi
     ann=${ann//\\n/$'\n'}
     [[ "$sup" == "-" ]] && sup=""
