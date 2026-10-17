@@ -22,7 +22,7 @@
 #                                с сертификатом Let's Encrypt (как vpn reality self); обязателен для http3
 #   XHTTP_PORT=8443            — порт сервера VLESS + XHTTP + Reality (0 — не создавать)
 #   HOP_PORTS=20000-50000      — включить port hopping для Hysteria2 (по умолчанию выключен)
-#   FASTEST=0                  — не создавать сервер «Самый быстрый» (по умолчанию создаётся)
+#   FASTEST=0                  — не создавать сервер «Лучший сервер» (по умолчанию создаётся)
 #   NODE=1                     — поставить как ноду для главной панели: без своих пользователей,
 #                                в конце печатает команду «vpn node add …» для главного сервера
 #   NO_FIREWALL=1              — не трогать ufw
@@ -1465,8 +1465,8 @@ UNIT
     esac
 }
 
-# ---------------------------------------------------------------- «Самый быстрый» (балансировщик в JSON-подписке)
-FASTEST_DEFAULT_NAME="⚡ Самый быстрый"
+# ---------------------------------------------------------------- «Лучший сервер» (балансировщик в JSON-подписке)
+FASTEST_DEFAULT_NAME="⚡ Лучший сервер"
 FASTEST_DEFAULT_CLIENTS="happ,v2raytun,incy"
 # Проверка серверов клиентом (burstObservatory): цикл = interval × sampling; сервер считается упавшим после 1–2 циклов
 # подряд неудачных проверок, то есть переключение занимает от одного до двух циклов. Минимум interval — 10s.
@@ -1545,7 +1545,7 @@ do_fastest() {
     if [[ -n "$obs_i$obs_n$obs_t" && "$action" != on ]]; then echo "--interval, --sampling и --timeout задаются вместе с on: vpn fastest on --interval 10s"; exit 1; fi
     case "$action" in
     on)
-        (( $(jq length <<<"$INBOUNDS") >= 2 )) || { echo "«Самый быстрый» выбирает из нескольких серверов, а сейчас он один. Добавь ещё: vpn xhttp on (или Hysteria2/нода)"; exit 1; }
+        (( $(jq length <<<"$INBOUNDS") >= 2 )) || { echo "«Лучший сервер» выбирает из нескольких серверов, а сейчас он один. Добавь ещё: vpn xhttp on (или Hysteria2/нода)"; exit 1; }
         vless_encryption_fix
         clients=${clients:-${FASTEST_CLIENTS:-$FASTEST_DEFAULT_CLIENTS}}
         if [[ -z "${FASTEST_ID:-}" ]] || ! api GET /sub-balancers | jq -e --argjson id "$FASTEST_ID" '.obj[]? | select(.id == $id)' >/dev/null; then
@@ -1571,15 +1571,15 @@ do_fastest() {
         echo "В клиентах обнови подписку: сервер появится первым в списке."
         ;;
     off)
-        [[ -n "${FASTEST_ID:-}" ]] || { echo "«Самый быстрый» не включён"; return; }
+        [[ -n "${FASTEST_ID:-}" ]] || { echo "«Лучший сервер» не включён"; return; }
         api DELETE "/sub-balancers/$FASTEST_ID" >/dev/null || true
         fastest_settings off ""
         env_set FASTEST_ID ""
         restart_panel
-        echo "«Самый быстрый» выключен, все клиенты снова получают обычные ссылки. Обнови подписку в клиентах."
+        echo "«Лучший сервер» выключен, все клиенты снова получают обычные ссылки. Обнови подписку в клиентах."
         ;;
     status|"")
-        if [[ -z "${FASTEST_ID:-}" ]]; then echo "«Самый быстрый» выключен. Включить: vpn fastest on"; return; fi
+        if [[ -z "${FASTEST_ID:-}" ]]; then echo "«Лучший сервер» выключен. Включить: vpn fastest on"; return; fi
         r=$(api GET /sub-balancers | jq -c --argjson id "$FASTEST_ID" '.obj[]? | select(.id == $id)')
         echo "«$(jq -r .remark <<<"$r")» включён: выбирает самый быстрый из серверов ($(jq -r '.inboundIds | length' <<<"$r") шт.)"
         echo "Получают его клиенты: ${FASTEST_CLIENTS:-$FASTEST_DEFAULT_CLIENTS} (остальные — обычные ссылки)"
@@ -1891,7 +1891,7 @@ do_check() {
             if jq -e '[.[] | .outbounds[] | select(.protocol == "vless") | .settings.encryption] | all(. == "none")' >/dev/null 2>&1 <<<"$fj"; then :; else
                 r_fail "В JSON-подписке у VLESS пустой encryption — клиенты не подключатся: vpn fastest on"; fi
         else
-            r_fail "JSON-подписка не отдаёт «Самый быстрый» (клиенты ${FASTEST_CLIENTS:-?}): vpn fastest on"
+            r_fail "JSON-подписка не отдаёт «Лучший сервер» (клиенты ${FASTEST_CLIENTS:-?}): vpn fastest on"
             fj=""
         fi
     fi
@@ -1913,8 +1913,8 @@ do_check() {
     local ip_out
     if [[ -n "$fj" ]]; then
         ip_out=$(e2e_json "$(jq -c '.[0]' <<<"$fj")" 10874)
-        [[ -n "$ip_out" ]] && r_ok "«Самый быстрый» работает, выход в интернет с IP ${ip_out}" \
-            || r_fail "«Самый быстрый»: клиент не смог выйти в интернет через балансировщик"
+        [[ -n "$ip_out" ]] && r_ok "«Лучший сервер» работает, выход в интернет с IP ${ip_out}" \
+            || r_fail "«Лучший сервер»: клиент не смог выйти в интернет через балансировщик"
     fi
     if [[ -n "${xh:-}" ]]; then
         ip_out=$(e2e "$xh" 10873)
@@ -1976,7 +1976,7 @@ do_check() {
 
 # ---------------------------------------------------------------- ноды: несколько серверов в одной подписке
 # Главная панель (этот сервер) управляет другими 3x-ui (нодами) через их API: пользователи, лимиты,
-# трафик и подписка — здесь, серверы нод попадают в ту же подписку и в «Самый быстрый».
+# трафик и подписка — здесь, серверы нод попадают в ту же подписку и в «Лучший сервер».
 XUI_CLI=${XUI_CLI:-/usr/local/x-ui/x-ui}
 is_node() { [[ "${ROLE:-}" == node ]]; }
 node_guard() {
@@ -1997,7 +1997,7 @@ node_parse_url() { # <https://адрес:порт/путь/> → NU_SCHEME NU_HO
     NU_SCHEME=${BASH_REMATCH[1]}; NU_HOST=${BASH_REMATCH[2]}; NU_PORT=${BASH_REMATCH[3]}; NU_PATH=${BASH_REMATCH[4]:-/}
     [[ "$NU_PATH" == */ ]] || NU_PATH="$NU_PATH/"
 }
-node_sync() { # все пользователи → на все серверы нод; INBOUNDS и «Самый быстрый» — по факту. Печатает число новых серверов
+node_sync() { # все пользователи → на все серверы нод; INBOUNDS и «Лучший сервер» — по факту. Печатает число новых серверов
     local ids all emails id cur miss new=0
     all=$(api GET /inbounds/list | jq -c '[.obj[]?.id]')
     env_set INBOUNDS "$(jq -c --argjson a "$all" '[.[] | select(. as $x | $a | index($x))]' <<<"$INBOUNDS")"
@@ -2278,7 +2278,7 @@ vpn http3 on [порт] [--name Т] | off     — доп. сервер VLESS + X
                                            (нужен vpn reality self; по умолчанию порт 4443/udp)
 vpn hop on [от-до] | off                 — port hopping для Hysteria2 (по умолчанию UDP 20000-50000)
 vpn fastest on|off|status [--name Т] [--clients happ,v2raytun,incy] [--interval 10s] [--sampling 2] [--timeout 4s]
-                                         — сервер «Самый быстрый»: сам выбирает лучший протокол
+                                         — сервер «Лучший сервер»: сам выбирает лучший протокол
                                            (только в клиентах из списка, остальные получают обычные ссылки)
 vpn help                                 — эта справка
 Подробный гайд: https://github.com/p0sixxx/3x-ui-autodeploy/blob/main/docs/vpn-commands.md
@@ -2415,7 +2415,7 @@ finish() {
     setup_self_domain
     if [[ "${FASTEST:-1}" != 0 ]]; then
         if (( $(sed -n "s/^INBOUNDS='\(.*\)'/\1/p" "$VPN_DIR/vpn.env" | jq length) >= 2 )); then vpn fastest on | sed 's/^/    /'
-        else echo "    «Самый быстрый» не создаю: сервер один (добавится, когда появится второй: vpn fastest on)"; fi
+        else echo "    «Лучший сервер» не создаю: сервер один (добавится, когда появится второй: vpn fastest on)"; fi
     fi
     vpn add me 0 0 "владелец" >/dev/null
     echo
