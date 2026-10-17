@@ -2241,6 +2241,215 @@ do_trace() {
     echo "Запись сохранена: $f (удалить: rm $f)"
 }
 
+# ---------------------------------------------------------------- перенос на другой сервер
+do_export() { # [файл] — все пользователи (UUID, ключи, ID подписки, лимиты, срок, трафик) и настройки подписки → JSON
+    node_guard
+    local out=${1:-} all cl bundle n
+    if [[ -z "$out" && -t 1 ]]; then
+        echo "Файл содержит ключи пользователей. Укажи файл: vpn export /root/vpn-clients.json" >&2
+        echo "(или на новом сервере: vpn import --from root@<IP этого сервера>)" >&2
+        exit 1
+    fi
+    all=$(api POST /setting/all); ok "$all"
+    cl=$(api GET /clients/export); ok "$cl"
+    bundle=$(jq --argjson st "$all" --arg hc "$HC_USER" \
+        --arg host "${PUBLIC_HOST:-}" --arg ip "${SERVER_IP:-}" --arg sd "${SELF_DOMAIN:-}" --arg bd "${SUB_DOMAIN:-}" \
+        --arg short "${SUB_SHORT:-}" --arg dev "${DEF_DEVICES:-}" --arg ips "${DEF_IPS:-}" --arg hop "${HOP_PORTS:-}" \
+        --arg xh "$(xhttp_id)" --arg h3 "$(h3_id)" --arg fa "${FASTEST_ID:-}" --arg ts "$(date +%s)" '. as $cl | {
+        format: "vpn-export", version: 1, created: ($ts | tonumber),
+        source: {host: $host, ip: $ip},
+        domains: {self: $sd, sub: $bd, short: ($short != "")},
+        features: {xhttp: ($xh != ""), http3: ($h3 != ""), hop: $hop, fastest: ($fa != "")},
+        sub: {port: $st.obj.subPort, path: $st.obj.subPath},
+        brand: {title: ($st.obj.subTitle // ""), announce: ($st.obj.subAnnounce // ""), support: ($st.obj.subSupportUrl // ""),
+                profileMode: ($st.obj.subProfileMode // ""), profileUrl: ($st.obj.subProfileUrl // "")},
+        defaults: {devices: $dev, ips: $ips},
+        clients: [$cl.obj[]? | select(.client.email != $hc) | del(.inboundIds)]
+    }' <<<"$cl") || { echo "Не удалось собрать экспорт" >&2; exit 1; }
+    n=$(jq '.clients | length' <<<"$bundle")
+    if [[ -n "$out" ]]; then
+        ( umask 077; printf '%s\n' "$bundle" > "$out" )
+        echo "Экспортировано пользователей: ${n} → ${out} (файл с ключами, после переноса удали: rm ${out})" >&2
+    else
+        printf '%s\n' "$bundle"
+        echo "Экспортировано пользователей: ${n}" >&2
+    fi
+}
+
+do_import() { # <файл|-> | --from [user@]хост[:порт]  [--update] [--no-links] [--no-brand] [--yes]
+    node_guard
+    local src="" from="" links=1 brand=1 yes=0 sync=0 a bundle n tb cur skipped created tty=0
+    while [[ $# -gt 0 ]]; do
+        a=$1; shift
+        case "$a" in
+            --from) from=${1:-}; [[ -n "$from" ]] || { echo "--from: укажи [user@]хост[:порт]"; exit 1; }; shift ;;
+            --update) sync=1 ;;
+            --no-links) links=0 ;;
+            --no-brand) brand=0 ;;
+            --yes|-y) yes=1 ;;
+            -) src=- ;;
+            -*) echo "Неизвестный параметр: $a (см. vpn help)"; exit 1 ;;
+            *) src=$a ;;
+        esac
+    done
+    [[ -n "$from" || -n "$src" ]] || { echo "Использование: vpn import <файл> | --from [user@]хост[:порт] [--update] [--no-links] [--no-brand] [--yes]"; exit 1; }
+    if [[ -n "$from" ]]; then
+        local target port=22 sshopt=()
+        target=${from%%:*}; [[ "$from" == *:* ]] && port=${from##*:}
+        [[ "$target" == *@* ]] || target="root@${target}"
+        [[ "$port" =~ ^[0-9]+$ ]] || { echo "--from: порт — число"; exit 1; }
+        sshopt=(-n -p "$port" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15)
+        echo "Подключаюсь к ${target} (порт ${port}); если спросит пароль — это пароль root старого сервера…" >&2
+        bundle=$(ssh "${sshopt[@]}" "$target" /usr/local/bin/vpn export) \
+            || { echo "Не удалось получить данные по ssh. Проверь адрес и доступ; на старом сервере должен быть свежий vpn: bash <(curl -fsSL https://raw.githubusercontent.com/p0sixxx/3x-ui-autodeploy/main/vpn-setup.sh) --cli"; exit 1; }
+    elif [[ "$src" == - ]]; then
+        bundle=$(cat)
+    else
+        [[ -r "$src" ]] || { echo "Нет файла $src"; exit 1; }
+        bundle=$(cat "$src")
+    fi
+    jq -e '.format == "vpn-export" and (.clients | type == "array")' >/dev/null 2>&1 <<<"$bundle" || {
+        echo "Это не экспорт vpn."
+        echo "Скорее всего, на старом сервере старая версия vpn без команды export. Обнови её там (пользователи не затрагиваются):"
+        echo "  bash <(curl -fsSL https://raw.githubusercontent.com/p0sixxx/3x-ui-autodeploy/main/vpn-setup.sh) --cli"
+        exit 1; }
+    n=$(jq '.clients | length' <<<"$bundle")
+    tb=$(jq '[.clients[].traffic // {} | (.up // 0) + (.down // 0)] | add // 0' <<<"$bundle")
+    cur=$(all_emails)
+    # кого создавать, а кого обновлять. me делает установщик, поэтому «свежий» me заменяется старым (иначе ссылка владельца изменится);
+    # с --update данными старого сервера перезаписываются все, кто уже есть здесь (срок, лимиты, трафик, новые ключи)
+    local mesub new_list upd_list n_new n_upd n_skip
+    mesub=$(api GET /clients/list | jq -r '[.obj[]? | select(.email == "me")][0].subId // empty')
+    new_list=$(jq -c --argjson cur "$cur" --argjson ib "$INBOUNDS" \
+        '[.clients[] | select(.client.email as $e | $cur | index($e) | not) | .inboundIds = $ib]' <<<"$bundle")
+    upd_list=$(jq -c --argjson cur "$cur" --argjson all "$sync" --arg ms "$mesub" \
+        '[.clients[] | select((.client.email as $e | $cur | index($e)) and ($all == 1 or (.client.email == "me" and $ms != "" and .client.subId != $ms)))]' <<<"$bundle")
+    n_new=$(jq 'length' <<<"$new_list"); n_upd=$(jq 'length' <<<"$upd_list"); n_skip=$(( n - n_new - n_upd ))
+    echo "В экспорте: пользователей ${n}, трафик уже израсходован $(awk -v b="$tb" -v G=$GiB 'BEGIN{printf "%.1f", b/G}') ГБ, источник: $(jq -r '.source.host // "?"' <<<"$bundle")"
+    echo "  Создам новых: ${n_new}; обновлю: ${n_upd}; пропущу (уже есть здесь): ${n_skip}"
+    if (( n_upd > 0 )); then echo "  Обновлю: $(jq -r '[.[].client.email] | join(", ")' <<<"$upd_list")"; fi
+    if (( n_skip > 0 )); then
+        echo "  Пропущу: $(jq -r --argjson cur "$cur" --argjson u "$upd_list" '[.clients[].client.email | select((. as $e | $cur | index($e)) and (. as $e | ($u | map(.client.email) | index($e)) | not))] | join(", ")' <<<"$bundle")"
+        echo "  (чтобы обновить их данными со старого сервера — срок, лимиты, трафик — добавь --update)"
+    fi
+    (( n_new + n_upd > 0 )) || { echo "Переносить нечего: все пользователи уже здесь."; }
+    if (( ! yes )) && (( n_new + n_upd > 0 )); then
+        { : </dev/tty; } 2>/dev/null && tty=1
+        (( tty )) || { echo "Нет терминала — добавь --yes"; exit 1; }
+        read -r -p "Перенести? [y/N]: " a </dev/tty || true
+        [[ "${a,,}" == y || "${a,,}" == yes || "${a,,}" == д || "${a,,}" == да ]] || { echo "Отменено."; exit 1; }
+    fi
+
+    local res e
+    if (( n_new > 0 )); then
+        echo "Переношу пользователей…"
+        # тело через stdin: список пользователей может не поместиться в аргумент командной строки
+        res=$(jq -c '{data: (. | tostring)}' <<<"$new_list" \
+            | api POST /clients/import -H 'Content-Type: application/json' --data-binary @- --max-time 600); ok "$res"
+        created=$(jq -r '.obj.created // 0' <<<"$res")
+        skipped=$(jq -r '[.obj.skipped[]? | "    - \(.email): \(.reason)"] | join("\n")' <<<"$res")
+        echo "Создано: ${created} из ${n_new}"
+        if [[ -n "$skipped" ]]; then echo "  Пропущено:"; echo "$skipped"; fi
+    fi
+    local pu pt
+    while IFS=$'\x1f' read -r e pu pt; do
+        [[ -n "$e" ]] || continue
+        ok "$(api_json POST "/clients/update/${e}" "$pu")"
+        ok "$(api_json POST "/clients/updateTraffic/${e}" "$pt")"
+    done < <(jq -r '.[] | [.client.email,
+        (.client | {email, id, auth, subId, flow, limitIp, limitHwid, tgId, comment, reset, enable, totalGB, expiryTime} | tojson),
+        ({upload: (.traffic.up // 0), download: (.traffic.down // 0)} | tojson)] | join("\u001f")' <<<"$upd_list")
+    (( n_upd == 0 )) || echo "Обновлено: ${n_upd}"
+
+    # порт и путь подписки, подпись подписки — как на старом сервере, чтобы прежние ссылки заработали после переключения DNS
+    local old_all new_port new_path cur_uri cur_path sch host new_uri hc_sid code upd changed=0 lk=0
+    old_all=$(api POST /setting/all); ok "$old_all"
+    upd=$(jq '.obj' <<<"$old_all")
+    new_port=$(jq -r '.sub.port // empty' <<<"$bundle"); new_path=$(jq -r '.sub.path // empty' <<<"$bundle")
+    if (( links )) && [[ "$new_port" =~ ^[0-9]+$ && -n "$new_path" ]]; then
+        cur_uri=$(jq -r '.obj.subURI' <<<"$old_all"); cur_path=$(jq -r '.obj.subPath' <<<"$old_all")
+        if [[ "$new_port" == "$SUB_PORT" && "$new_path" == "$cur_path" ]]; then
+            echo "Порт и путь подписки уже совпадают со старым сервером."
+        elif [[ "$new_port" != "$SUB_PORT" ]] && listening "$new_port" tcp; then
+            echo "Порт подписки ${new_port} со старого сервера занят здесь — ссылки со старым портом не заработают. Освободи порт и повтори vpn import (перенесённые пользователи будут пропущены)."
+        else
+            sch=$(sed -E 's|^(https?)://.*|\1|' <<<"$cur_uri"); host=$(sed -E 's|^https?://([^/:]+).*|\1|' <<<"$cur_uri")
+            if [[ -n "${SUB_SHORT:-}" ]]; then new_uri=$cur_uri; else new_uri="${sch}://${host}:${new_port}${new_path}"; fi
+            upd=$(jq --argjson p "$new_port" --arg path "$new_path" --arg uri "$new_uri" '.subPort = $p | .subPath = $path | .subURI = $uri' <<<"$upd")
+            changed=1; lk=1
+        fi
+    fi
+    if (( brand )); then
+        upd=$(jq --argjson b "$(jq -c '.brand // {}' <<<"$bundle")" '
+            (if ($b.title // "") != "" then .subTitle = $b.title else . end)
+            | (if ($b.announce // "") != "" then .subAnnounce = $b.announce else . end)
+            | (if ($b.support // "") != "" then .subSupportUrl = $b.support else . end)
+            | (if ($b.profileMode // "") != "" then .subProfileMode = $b.profileMode | .subProfileUrl = ($b.profileUrl // "") else . end)' <<<"$upd")
+        [[ "$upd" == "$(jq '.obj' <<<"$old_all")" ]] || changed=1
+    fi
+    if (( changed )); then
+        echo "Применяю настройки подписки (панель перезапустится, VPN моргнёт на пару секунд)…"
+        ok "$(api_json POST /setting/update "$upd")"
+        restart_panel
+        wait_panel || true
+        if (( lk )); then
+            local old_port=$SUB_PORT old_base=$SUB_BASE old_spath=${SUB_PATH:-}
+            env_set SUB_PORT "$new_port"; env_set SUB_PATH "$new_path"
+            [[ -n "${SUB_SHORT:-}" ]] || env_set SUB_BASE "$(jq -r .subURI <<<"$upd")"
+            if [[ "$new_port" != "$old_port" ]] && command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
+                ufw allow "${new_port}/tcp" comment 3x-ui-sub >/dev/null 2>&1 || true
+            fi
+            if [[ -n "${SUB_SHORT:-}" && -n "${SELF_DOMAIN:-}" ]]; then self_nginx "$SELF_DOMAIN" "$SELF_PORT"; fi
+            hc_sid=$(api GET /clients/list | jq -r --arg hc "$HC_USER" '[.obj[]? | select(.email == $hc)][0].subId // empty')
+            code=200
+            if [[ -n "$hc_sid" ]]; then
+                local i; code=000; sch=$(sed -E 's|^(https?)://.*|\1|' <<<"$(jq -r .subURI <<<"$upd")")
+                for i in 1 2 3 4 5 6; do
+                    code=$(curl -sk --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 8 "${sch}://127.0.0.1:${new_port}${new_path}${hc_sid}" 2>/dev/null || true)
+                    [[ "$code" == 200 ]] && break; sleep 1
+                done
+            fi
+            if [[ "$code" != 200 ]]; then
+                echo "Подписка не отдаётся на порту ${new_port} (HTTP ${code}) — возвращаю прежние настройки. Пользователи при этом перенесены."
+                ok "$(api_json POST /setting/update "$(jq '.obj' <<<"$old_all")")"
+                restart_panel
+                env_set SUB_PORT "$old_port"; env_set SUB_BASE "$old_base"; env_set SUB_PATH "$old_spath"
+                if [[ "$new_port" != "$old_port" ]] && command -v ufw >/dev/null; then ufw delete allow "${new_port}/tcp" >/dev/null 2>&1 || true; fi
+                if [[ -n "${SUB_SHORT:-}" && -n "${SELF_DOMAIN:-}" ]]; then self_nginx "$SELF_DOMAIN" "$SELF_PORT"; fi
+                exit 1
+            fi
+            if [[ "$new_port" != "$old_port" ]] && command -v ufw >/dev/null; then ufw delete allow "${old_port}/tcp" >/dev/null 2>&1 || true; fi
+            echo "Порт и путь подписки как на старом сервере: ${new_port}${new_path}"
+        fi
+    fi
+    local d_dev d_ips
+    d_dev=$(jq -r '.defaults.devices // empty' <<<"$bundle"); d_ips=$(jq -r '.defaults.ips // empty' <<<"$bundle")
+    if [[ -n "$d_dev" ]]; then env_set DEF_DEVICES "$d_dev"; fi
+    if [[ -n "$d_ips" ]]; then env_set DEF_IPS "$d_ips"; fi
+
+    local sd sb step=1 hp
+    sd=$(jq -r '.domains.self // empty' <<<"$bundle"); sb=$(jq -r '.domains.sub // empty' <<<"$bundle")
+    echo
+    if (( n_new + n_upd > 0 )); then echo "Готово. Пользователи, ключи, ID подписок, лимиты, сроки и трафик перенесены."; else echo "Готово."; fi
+    echo "Проверка по IP этого сервера: vpn link me   (ID у me тот же, что был на старом)"
+    echo
+    if [[ -n "$sd" || -n "$sb" ]]; then
+        echo "Что дальше (когда проверишь работу по IP):"
+        echo "  ${step}. Переключи DNS: A-запись ${sb:-$sd} → ${SERVER_IP} и подожди TTL (5–15 минут)."; step=$((step + 1))
+        if [[ -n "$sd" ]]; then echo "  ${step}. vpn reality self ${sd}"; step=$((step + 1)); fi
+        if [[ -n "$sb" ]]; then echo "  ${step}. vpn sub-domain ${sb}$([[ "$(jq -r '.domains.short' <<<"$bundle")" == true ]] || echo ' --port')"; step=$((step + 1)); fi
+        if [[ "$(jq -r '.features.http3' <<<"$bundle")" == true && -z "$(h3_id)" ]]; then echo "  ${step}. vpn http3 on   (на старом сервере был включён)"; step=$((step + 1)); fi
+        echo "  Клиенты подхватят новый сервер при следующем обновлении подписки (раз в 6 часов); старый сервер держи до тех пор."
+    else
+        echo "Ссылки на старом сервере привязаны к его IP: пользователям нужно добавить новые (vpn link <имя>)."
+        echo "Чтобы в будущем переезды были незаметными, заведи домен: vpn reality self <домен>, затем vpn sub-domain <домен>."
+    fi
+    if [[ "$(jq -r '.features.xhttp' <<<"$bundle")" == true && -z "$(xhttp_id)" ]]; then echo "  •  vpn xhttp on   (на старом сервере был включён)"; fi
+    hp=$(jq -r '.features.hop // empty' <<<"$bundle")
+    if [[ -n "$hp" && -z "${HOP_PORTS:-}" ]]; then echo "  •  vpn hop on ${hp}   (port hopping был включён)"; fi
+    if [[ "$(jq -r '.features.fastest' <<<"$bundle")" == true && -z "${FASTEST_ID:-}" ]]; then echo "  •  vpn fastest on   («Лучший сервер» был включён)"; fi
+}
+
 usage() {
     cat <<EOF
 vpn add <имя> <ГБ> <дней> [комментарий] [--devices N] [--ips N]
@@ -2258,6 +2467,12 @@ vpn off|on <имя>                         — отключить / включ�
 vpn del <имя>                            — удалить
 vpn panel [hide|show|status]             — адрес и логин панели; hide — закрыть панель снаружи (доступ через ssh-туннель)
 vpn check [--local]                      — полная диагностика (--local: без проверки снаружи)
+vpn export [файл]                        — выгрузить всех пользователей (ключи, ID подписок, лимиты, сроки, трафик) в файл
+vpn import <файл> | --from [user@]хост[:порт] [--no-links] [--no-brand] [--yes]
+                                         — перенос со старого сервера на этот (новый, главный): пользователи с теми же
+                                           ссылками подписки; --from забирает данные по ssh; порт и путь подписки
+                                           становятся как на старом (--no-links — не менять), подпись подписки
+                                           тоже копируется (--no-brand — не копировать)
 vpn node                                 — ноды (другие серверы в этой же подписке): список
 vpn node add <адрес панели> <токен> [--name имя] — подключить сервер-ноду (адрес и токен: vpn node prepare на ноде)
 vpn node sync | del <имя>                — дотянуть новые серверы нод и всех пользователей / отключить ноду
@@ -2298,6 +2513,8 @@ fastest) load_env; node_guard; do_fastest "$@" ;;
 trace) load_env; do_trace "$@" ;;
 http3) load_env; do_http3 "$@" ;;
 node) load_env; do_node "$@" ;;
+export) load_env; do_export "$@" ;;
+import) load_env; do_import "$@" ;;
 _hop) hop_rules "${1:-up}" "${2:-20000-50000}" ;;
 _country) country_label "${1:-}" ;;
 add)
