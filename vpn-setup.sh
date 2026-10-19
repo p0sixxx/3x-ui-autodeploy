@@ -1497,6 +1497,26 @@ vless_encryption_fix() { # inbound'ы без encryption ломают JSON-под
         if [[ -z "$enc" ]]; then inbound_patch "$id" '.settings.encryption = "none"'; fi
     done
 }
+share_addr_bad() { # «id» своих серверов, у которых в ссылках не PUBLIC_HOST. После работы нодой основной
+    # сервер оставляет им стратегию «node», и 3x-ui подставляет домен подписки — Hysteria2 с сертификатом на IP ломается
+    api GET /inbounds/list | jq -r --argjson ib "${INBOUNDS:-[]}" --arg h "$PUBLIC_HOST" '.obj[]?
+        | select(.nodeId == null and (.id as $i | $ib | index($i)) and (.shareAddrStrategy != "custom" or .shareAddr != $h)) | .id'
+}
+share_addr_fix() { # → сколько серверов исправлено
+    local id n=0
+    for id in $(share_addr_bad); do
+        inbound_patch "$id" '.shareAddrStrategy = "custom" | .shareAddr = $h' --arg h "$PUBLIC_HOST"; n=$((n + 1))
+    done
+    echo "$n"
+}
+do_repair() {
+    local n
+    n=$(share_addr_fix)
+    vless_encryption_fix
+    if (( n > 0 )); then echo "Исправлен адрес в ссылках у серверов: ${n} (теперь ${PUBLIC_HOST}). В клиентах обнови подписку."
+    else echo "Адреса в ссылках в порядке (${PUBLIC_HOST})."; fi
+    echo "Проверка: vpn check --local"
+}
 balancer_form() { # <name> → аргументы curl для create/update балансировщика
     local id
     printf '%s\0' --data-urlencode "remark=$1" -d strategy=leastPing -d sortOrder=1 -d enabled=true
@@ -1874,6 +1894,9 @@ do_check() {
         fi
         if [[ -n "$(xhttp_id)" ]]; then
             [[ -n "$xh" ]] && r_ok "Подписка содержит VLESS XHTTP" || r_fail "В подписке нет ссылки VLESS XHTTP"
+        fi
+        if ! is_node && [[ -n "$(share_addr_bad 2>/dev/null)" ]]; then
+            r_fail "В ссылках этого сервера не его адрес ${PUBLIC_HOST} (так бывает после vpn promote) — исправить: vpn repair"
         fi
         if [[ -n "$(h3_id)" ]]; then
             if [[ -n "$h3" ]] && grep -q 'alpn=h3' <<<"$h3"; then r_ok "Подписка содержит VLESS XHTTP HTTP3 (alpn h3)"
@@ -2297,6 +2320,7 @@ do_promote() { # [--from цель] [--nodes цель,цель] [--sub-link сс�
         echo "Импорт не прошёл. Повтори: vpn import ${save} --yes"; exit 1
     fi
     load_env
+    share_addr_fix >/dev/null || true    # бывшая нода: в ссылках снова свой адрес, а не домен подписки
     if ! api GET "/clients/get/${HC_USER}" 2>/dev/null | jq -e '.success == true' >/dev/null 2>&1; then
         add_client "$HC_USER" 0 0 "служебный, для vpn check" >/dev/null 2>&1 || true
     fi
@@ -2812,6 +2836,7 @@ vpn off|on <имя>                         — отключить / включ�
 vpn del <имя>                            — удалить
 vpn panel [hide|show|status]             — адрес и логин панели; hide — закрыть панель снаружи (доступ через ssh-туннель)
 vpn check [--local]                      — полная диагностика (--local: без проверки снаружи)
+vpn repair                               — починить адрес в ссылках своих серверов (после vpn promote)
 vpn export [файл]                        — выгрузить всех пользователей (ключи, ID подписок, лимиты, сроки, трафик) в файл
 vpn import <файл экспорта | x-ui.db> | --from [user@]хост[:порт] | --links <файл> [--update] [--no-links] [--no-brand] [--yes]
                                          — перенос со старого сервера на этот (новый, главный): пользователи с теми же
@@ -2870,6 +2895,7 @@ trace) load_env; do_trace "$@" ;;
 http3) load_env; do_http3 "$@" ;;
 node) load_env; do_node "$@" ;;
 promote) load_env; do_promote "$@" ;;
+repair) load_env; node_guard; do_repair ;;
 _role) load_env; if is_node; then echo node; else echo main; fi ;;
 _nodes) load_env; if is_node; then echo "[]"; else node_list_json | jq -c '[.[] | {name, address, port}]'; fi ;;
 export) load_env; do_export "$@" ;;
