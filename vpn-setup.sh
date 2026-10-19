@@ -1960,6 +1960,10 @@ do_check() {
         while IFS=$'\t' read -r nname naddr nst nl; do
             [[ "$nst" == online ]] && r_ok "Нода ${nname} (${naddr}) в сети, ${nl} мс" || r_fail "Нода ${nname} (${naddr}): ${nst} — проверь сервер и его панель"
         done < <(jq -r '.[] | [.name, .address, (.status // "?"), (.latencyMs // 0 | tostring)] | @tsv' <<<"$nodes")
+        local noff
+        noff=$(api GET /inbounds/list 2>/dev/null | jq -r --argjson nd "$nodes" '[.obj[]? | select(.nodeId != null and .enable == false) | .nodeId] | unique | .[] as $i
+            | $nd[] | select(.id == $i) | .name' 2>/dev/null || true)
+        for nname in $noff; do r_warn "Нода ${nname} выключена, её серверов нет в подписке — вернуть: vpn node on ${nname}"; done
         nids=$(node_inbound_ids 2>/dev/null || echo '[]')
         nmiss=$(jq -c --argjson ib "$INBOUNDS" '[.[] | select(. as $x | $ib | index($x) | not)]' <<<"$nids")
         [[ "$nmiss" == "[]" ]] && r_ok "Все серверы нод ($(jq length <<<"$nids") шт.) в подписке у всех пользователей" \
@@ -2087,7 +2091,24 @@ do_node() {
         ids=$(api GET /inbounds/list)
         jq -r --argjson ib "$ids" '.[] | . as $n |
             "\(.name)  \(.address)  \(if .status == "online" then "в сети, \(.latencyMs) мс" else (.status // "?") end)  Xray \(.xrayVersion // "?")",
-            ($ib.obj[]? | select(.nodeId == $n.id) | "    \(.remark)  (\(.protocol), порт \(.port))")' <<<"$nodes"
+            ($ib.obj[]? | select(.nodeId == $n.id) | "    \(.remark)  (\(.protocol), порт \(.port))\(if .enable == false then "  — выключен (vpn node on \($n.name))" else "" end)")' <<<"$nodes"
+        ;;
+    off|on)
+        node_guard
+        local key=${1:-} nid ids id en=true n=0
+        [[ -n "$key" ]] || { echo "Использование: vpn node ${action} <имя>"; exit 1; }
+        nid=$(node_find "$key"); [[ -n "$nid" ]] || { echo "Нода «$key» не найдена (vpn node)"; exit 1; }
+        [[ "$action" == off ]] && en=false
+        ids=$(node_inbound_ids "$nid")
+        for id in $(jq -r '.[]' <<<"$ids"); do
+            ok "$(api_json POST "/inbounds/setEnable/$id" "{\"enable\": ${en}}")"; n=$((n + 1))
+        done
+        if [[ "$action" == off ]]; then
+            echo "Нода «$key» выключена: её серверы (${n}) убраны из подписки и из «Лучшего сервера». Пользователи и настройки сохранены."
+            echo "Вернуть: vpn node on ${key}. В клиентах обнови подписку."
+        else
+            echo "Нода «$key» включена: её серверы (${n}) снова в подписке. В клиентах обнови подписку."
+        fi
         ;;
     add)
         node_guard
@@ -2849,6 +2870,7 @@ vpn node                                 — ноды (другие сервер
 vpn node add <адрес панели> <токен> [--name имя] — подключить сервер-ноду (адрес и токен: vpn node prepare на ноде)
 vpn node sync | del <имя>                — дотянуть новые серверы нод и всех пользователей / отключить ноду
 vpn node rename <имя> <новое имя>        — переименовать ноду (видно только в vpn node; подписку не трогает)
+vpn node off|on <имя>                    — временно убрать серверы ноды из подписки / вернуть
 vpn promote [--from root@IP] [--nodes root@IP,…] [--sub-link ссылка] [--yes]
                                          — (на ноде) сделать этот сервер основным. --from: плановая смена, старый
                                            основной по ssh отдаёт пользователей и становится нодой. Без --from: авария,
