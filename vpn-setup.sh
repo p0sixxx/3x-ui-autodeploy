@@ -2104,7 +2104,7 @@ do_node() {
         sleep 3
         n=$(node_sync)
         echo "Готово: нода «${name}» (${NU_HOST}), серверов: $(jq length <<<"$(node_inbound_ids "$nid")"). Все пользователи добавлены на её серверы."
-        echo "В клиентах обнови подписку — серверы ноды появятся в ней и в «Самом быстром». Проверка: vpn check --local"
+        echo "В клиентах обнови подписку — серверы ноды появятся в ней и в «Лучшем сервере». Проверка: vpn check --local"
         ;;
     sync)
         node_guard
@@ -2129,6 +2129,23 @@ do_node() {
         if [[ -n "${FASTEST_ID:-}" ]]; then fastest_sync; fi
         echo "Нода «$key» отключена: пользователи сняты с её серверов, серверы убраны из подписки."
         echo "Сама нода не тронута (её 3x-ui и серверы остались). В клиентах обнови подписку."
+        ;;
+    rename)
+        node_guard
+        local key=${1:-} new=${2:-} nid r body taken
+        [[ -n "$key" && -n "$new" ]] || { echo "Использование: vpn node rename <имя> <новое имя>"; exit 1; }
+        [[ "$new" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "Имя ноды — латиница, цифры, . _ -"; exit 1; }
+        nid=$(node_find "$key"); [[ -n "$nid" ]] || { echo "Нода «$key» не найдена (vpn node)"; exit 1; }
+        taken=$(node_list_json | jq -r --arg n "$new" --argjson id "$nid" '.[] | select(.name == $n and .id != $id) | .name' | head -1)
+        [[ -z "$taken" ]] || { echo "Имя «$new» уже занято другой нодой"; exit 1; }
+        r=$(api GET "/nodes/get/$nid"); ok "$r"
+        # все поля как есть, меняется только имя (и remark, если он совпадал с именем); токен не передаём — панель его сохранит
+        body=$(jq -c --arg n "$new" '.obj | {id, name: $n, remark: (if (.remark // "") == "" or .remark == .name then $n else .remark end),
+            scheme, address, port, basePath, enable, allowPrivateAddress, tlsVerifyMode, pinnedCertSha256: (.pinnedCertSha256 // ""),
+            inboundSyncMode, inboundTags: (.inboundTags // []), outboundTag: (.outboundTag // "")}' <<<"$r")
+        r=$(api_json POST "/nodes/update/$nid" "$body")
+        jq -e '.success == true' >/dev/null 2>&1 <<<"$r" || { echo "Панель не приняла новое имя: $(jq -r '.msg // .' <<<"$r" 2>/dev/null) (нода должна быть в сети: vpn node)"; exit 1; }
+        echo "Нода «$key» теперь называется «$new». Серверы, пользователи и подписка не меняются."
         ;;
     prepare)
         [[ -n "${PANEL_URL:-}" ]] || { echo "Нет PANEL_URL в $ENV_FILE"; exit 1; }
@@ -2160,7 +2177,7 @@ do_node() {
         echo
         echo "Токен даёт полный доступ к панели этой ноды — не публикуй его. Новый токен: vpn node prepare (старый перестанет работать)."
         ;;
-    *) echo "Использование: vpn node [list] | add <адрес> <токен> [--name имя] | sync | del <имя> | prepare"; exit 1 ;;
+    *) echo "Использование: vpn node [list] | add <адрес> <токен> [--name имя] | sync | rename <имя> <новое> | del <имя> | prepare"; exit 1 ;;
     esac
 }
 
@@ -2647,6 +2664,7 @@ vpn import <файл экспорта | x-ui.db> | --from [user@]хост[:по�
 vpn node                                 — ноды (другие серверы в этой же подписке): список
 vpn node add <адрес панели> <токен> [--name имя] — подключить сервер-ноду (адрес и токен: vpn node prepare на ноде)
 vpn node sync | del <имя>                — дотянуть новые серверы нод и всех пользователей / отключить ноду
+vpn node rename <имя> <новое имя>        — переименовать ноду (видно только в vpn node; подписку не трогает)
 vpn node prepare                         — (на новом сервере) сделать его нодой и показать команду для главного
 vpn trace [IP] [секунд]                  — запись подключений клиентов и разбор: дошло ли, ответил ли сервер
 vpn reality [auto|<домен>|<ip:443> <домен>] — маскировка Reality: показать / подобрать в сети хостера / задать
