@@ -620,7 +620,7 @@ install_cli() {
 # vpn — управление пользователями и диагностика VPN на 3x-ui. Конфиг: /etc/vpn/vpn.env
 set -euo pipefail
 [[ $EUID -eq 0 ]] || { echo "Нужен root"; exit 1; }
-ENV_FILE=/etc/vpn/vpn.env
+ENV_FILE=${VPN_ENV_FILE:-/etc/vpn/vpn.env}
 GiB=1073741824
 HC_USER=healthcheck
 CH=https://check-host.net
@@ -2103,6 +2103,7 @@ do_node() {
         [[ "$ids" != "[]" ]] || { echo "Серверы ноды не появились за 40 с. Проверь: vpn node, затем vpn node sync"; exit 1; }
         sleep 3
         n=$(node_sync)
+        sleep 5; node_sync >/dev/null   # второй проход: сразу после подключения панель видит старый список пользователей ноды
         echo "Готово: нода «${name}» (${NU_HOST}), серверов: $(jq length <<<"$(node_inbound_ids "$nid")"). Все пользователи добавлены на её серверы."
         echo "В клиентах обнови подписку — серверы ноды появятся в ней и в «Лучшем сервере». Проверка: vpn check --local"
         ;;
@@ -2179,6 +2180,154 @@ do_node() {
         ;;
     *) echo "Использование: vpn node [list] | add <адрес> <токен> [--name имя] | sync | rename <имя> <новое> | del <имя> | prepare"; exit 1 ;;
     esac
+}
+
+# ---------------------------------------------------------------- смена основного сервера: vpn promote
+VPN_REPO_RAW=https://raw.githubusercontent.com/p0sixxx/3x-ui-autodeploy/main/vpn-setup.sh
+ssh_target() { # <[user@]host[:port]> → SSH_T (user@host), SSH_P (порт)
+    SSH_T=${1%%:*}; SSH_P=22; [[ "$1" == *:* ]] && SSH_P=${1##*:}
+    [[ "$SSH_T" == *@* ]] || SSH_T="root@${SSH_T}"
+    [[ "$SSH_P" =~ ^[0-9]+$ ]] || { echo "Порт ssh — число: $1" >&2; return 1; }
+}
+rsh() { # <[user@]host[:port]> <команда…> — выполнить на другом сервере; одно соединение на сервер (пароль спросит один раз)
+    ssh_target "$1" || return 1; shift
+    ssh -n -p "$SSH_P" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 \
+        -o ControlMaster=auto -o ControlPath=/tmp/vpn-ssh-%r@%h:%p -o ControlPersist=300 "$SSH_T" "$@"
+}
+rvpn_ready() { # <цель> — на сервере есть vpn с нужными командами, иначе обновить из репозитория
+    if ! rsh "$1" '/usr/local/bin/vpn help 2>/dev/null | grep -q "vpn promote"'; then
+        echo "  Обновляю vpn на $1 (пользователи не затрагиваются)…"
+        rsh "$1" "bash -c 'bash <(curl -fsSL ${VPN_REPO_RAW}) --cli'" >/dev/null 2>&1 \
+            && rsh "$1" '/usr/local/bin/vpn help 2>/dev/null | grep -q "vpn promote"' \
+            || { echo "Не удалось обновить vpn на $1 (есть ли там интернет и vpn?)"; return 1; }
+    fi
+}
+node_add_from() { # <вывод vpn node prepare> — подключить эту ноду к здешней панели; печатает имя
+    local cmdline url tok nm
+    cmdline=$(grep -o 'vpn node add [^ ]* [^ ]* --name [^ ]*' <<<"$1" | head -1)
+    [[ -n "$cmdline" ]] || return 1
+    read -r _ _ _ url tok _ nm <<<"$cmdline"
+    /usr/local/bin/vpn node add "$url" "$tok" --name "$nm" | sed 's/^/    /' >&2 || return 1
+    echo "$nm"
+}
+do_promote() { # [--from цель] [--nodes цель,цель] [--sub-link ссылка] [--yes]
+    local from="" nodes="" sublink="" yes=0 a
+    while [[ $# -gt 0 ]]; do
+        a=$1; shift
+        case "$a" in
+            --from) from=${1:-}; shift ;;
+            --nodes) nodes=${1:-}; shift ;;
+            --sub-link) sublink=${1:-}; shift ;;
+            --yes|-y) yes=1 ;;
+            *) echo "Неизвестный параметр: $a (см. vpn help)"; exit 1 ;;
+        esac
+    done
+    is_node || { echo "Этот сервер уже основной. vpn promote запускают на ноде, которая должна стать основной."; exit 1; }
+    local bundle oldnodes='[]' me="" t targets=() n i
+    if [[ -n "$from" ]]; then
+        echo "Плановая смена: старый основной ${from} станет нодой, этот сервер (${SERVER_IP}) — основным."
+        rvpn_ready "$from" || exit 1
+        [[ "$(rsh "$from" '/usr/local/bin/vpn _role')" == main ]] || { echo "${from} — не основной сервер (или vpn там не отвечает)."; exit 1; }
+        bundle=$(rsh "$from" '/usr/local/bin/vpn export') || { echo "Не удалось выгрузить пользователей с ${from}"; exit 1; }
+        oldnodes=$(rsh "$from" '/usr/local/bin/vpn _nodes') || oldnodes='[]'
+        me=$(jq -r --arg ip "$SERVER_IP" --arg h "${PUBLIC_HOST:-}" --argjson p "$PANEL_PORT" \
+            '[.[] | select((.address == $ip or .address == $h) and .port == $p)][0].name // empty' <<<"$oldnodes")
+        if [[ -z "$nodes" ]]; then
+            while IFS= read -r t; do [[ -n "$t" ]] && targets+=("root@$t"); done \
+                < <(jq -r --arg me "$me" '.[] | select(.name != $me) | .address' <<<"$oldnodes")
+        fi
+    else
+        echo "Аварийный режим: старый основной недоступен. Пользователи берутся из копии на этой ноде:"
+        echo "UUID, ID подписок, лимит трафика, срок и лимит IP — те же. Чего в копии нет: счётчики трафика (начнутся с нуля),"
+        echo "лимиты устройств (станут «без лимита» — потом vpn limit <имя> --devices N) и отключённые пользователи."
+        local cl; cl=$(api GET /clients/export); ok "$cl"
+        bundle=$(jq --arg hc "$HC_USER" '{format: "vpn-export", version: 1, created: 0, source: {host: "копия на ноде", ip: ""},
+            domains: {self: "", sub: "", short: false}, features: {xhttp: false, http3: false, hop: "", fastest: true},
+            sub: {port: 0, path: ""}, brand: {}, defaults: {},
+            clients: [.obj[]? | select(.client.email != $hc) | del(.inboundIds) | del(.traffic)]}' <<<"$cl")
+        if [[ -n "$sublink" ]]; then
+            [[ "$sublink" =~ ^https?://([^/:]+)(:([0-9]+))?(/.*)?/([A-Za-z0-9_-]{3,64})/?$ ]] \
+                || { echo "--sub-link: нужна любая старая ссылка подписки (https://домен[:порт]/путь/ID)"; exit 1; }
+            local h=${BASH_REMATCH[1]} p=${BASH_REMATCH[3]} pa=${BASH_REMATCH[4]}
+            [[ -z "$pa" ]] || pa="${pa%/}/"
+            bundle=$(jq --arg h "$h" --arg p "${p:-0}" --arg pa "$pa" '.sub = {port: ($p | tonumber), path: $pa}
+                | if ($h | test("^[0-9.]+$")) then . else .domains = {self: (if $p == "0" then $h else "" end), sub: $h, short: ($p == "0")} end' <<<"$bundle")
+        fi
+    fi
+    if [[ -n "$nodes" ]]; then IFS=',' read -r -a targets <<<"$nodes"; fi
+    jq -e '.format == "vpn-export"' >/dev/null 2>&1 <<<"$bundle" || { echo "Не получилось собрать данные пользователей."; exit 1; }
+    n=$(jq '.clients | length' <<<"$bundle")
+    echo
+    echo "Будет так:"
+    echo "  • этот сервер (${SERVER_IP}) — основной, пользователей: ${n}"
+    [[ -z "$from" ]] || echo "  • ${from} — нода этого сервера"
+    if (( ${#targets[@]} )); then echo "  • перепривязать к этому серверу ноды: ${targets[*]}"; else echo "  • других нод для перепривязки нет"; fi
+    echo "  Пользователи на время переключения (пара минут) могут терять соединение."
+    if (( ! yes )); then
+        { : </dev/tty; } 2>/dev/null || { echo "Нет терминала — добавь --yes"; exit 1; }
+        read -r -p "Продолжить? [y/N]: " a </dev/tty || true
+        [[ "${a,,}" =~ ^(y|yes|д|да)$ ]] || { echo "Отменено."; exit 1; }
+    fi
+    local save; save="/root/vpn-promote-$(date +%F-%H%M%S).json"
+    ( umask 077; printf '%s\n' "$bundle" > "$save" )
+    echo "Копия пользователей: ${save} (если что-то пойдёт не так: vpn import ${save} --yes)"
+
+    # 1. старый основной отпускает все ноды: пользователи снимаются с них, ноды свободны для нового основного
+    if [[ -n "$from" ]]; then
+        for t in $(jq -r '.[].name' <<<"$oldnodes"); do
+            echo "  ${from}: отключаю ноду ${t}"
+            rsh "$from" "/usr/local/bin/vpn node del '${t}'" >/dev/null || echo "    не получилось — продолжаю"
+        done
+    fi
+    # 2. этот сервер — основной: копии пользователей от старого основного убираем и заводим их заново как свои
+    local emails; emails=$(all_emails)
+    if [[ "$emails" != "[]" ]]; then ok "$(api_json POST /clients/bulkDel "$(jq -nc --argjson e "$emails" '{emails: $e}')")"; fi
+    env_set ROLE ""
+    echo "Переношу пользователей…"
+    if ! printf '%s' "$bundle" | IMPORT_NO_HINTS=1 /usr/local/bin/vpn import - --yes | sed 's/^/    /'; then
+        echo "Импорт не прошёл. Повтори: vpn import ${save} --yes"; exit 1
+    fi
+    load_env
+    if ! api GET "/clients/get/${HC_USER}" 2>/dev/null | jq -e '.success == true' >/dev/null 2>&1; then
+        add_client "$HC_USER" 0 0 "служебный, для vpn check" >/dev/null 2>&1 || true
+    fi
+    # 3. старый основной → нода этого сервера
+    local added=() out nm
+    if [[ -n "$from" ]]; then
+        echo "  ${from}: делаю нодой…"
+        out=$(rsh "$from" '/usr/local/bin/vpn panel show >/dev/null 2>&1; /usr/local/bin/vpn node prepare --yes') || out=""
+        if nm=$(node_add_from "$out"); then added+=("$nm"); else echo "    не получилось подключить ${from} — на нём: vpn node prepare, здесь: vpn node add …"; fi
+    fi
+    # 4. остальные ноды
+    for t in "${targets[@]}"; do
+        echo "  ${t}: перепривязываю…"
+        if ! rvpn_ready "$t"; then echo "    пропускаю ${t}"; continue; fi
+        out=$(rsh "$t" '/usr/local/bin/vpn node prepare --yes') || out=""
+        if nm=$(node_add_from "$out"); then added+=("$nm"); else echo "    не получилось — на ${t}: vpn node prepare, здесь: vpn node add …"; fi
+    done
+    if (( ${#added[@]} )); then sleep 3; /usr/local/bin/vpn node sync >/dev/null 2>&1 || true; fi
+    # 5. «Лучший сервер»
+    if [[ "$(jq -r '.features.fastest' <<<"$bundle")" == true && -z "${FASTEST_ID:-}" ]]; then
+        /usr/local/bin/vpn fastest on 2>&1 | sed 's/^/    /' || true
+    fi
+    local dom sd
+    dom=$(jq -r '.domains.sub // empty | select(. != "")' <<<"$bundle"); [[ -n "$dom" ]] || dom=$(jq -r '.domains.self // empty' <<<"$bundle")
+    sd=${SELF_DOMAIN:-}
+    echo
+    echo "Готово: этот сервер основной. Пользователей: ${n}; нод подключено: ${#added[@]}${added[*]:+ (${added[*]})}."
+    echo
+    echo "Осталось вручную:"
+    if [[ -n "$dom" ]]; then
+        echo "  1. DNS: A-запись ${dom} → ${SERVER_IP}$( [[ -n "$sd" && -n "$from" ]] && echo "; ${sd} → IP старого основного (${from#*@})")"
+        echo "  2. Когда DNS обновится, здесь: vpn reality self ${dom} && vpn sub-domain ${dom}"
+        [[ -z "$(h3_id)" ]] || echo "     и пересоздать HTTP3 на новом домене: vpn http3 off && vpn http3 on --name \"…\""
+        [[ -z "$sd" || -z "$from" ]] || echo "  3. На ${from#*@}: vpn reality self ${sd} (и так же HTTP3, если он там есть)"
+    else
+        echo "  • Ссылки подписок были на IP старого основного — пользователям нужны новые: vpn link <имя>"
+    fi
+    [[ -n "$from" ]] || echo "  • Подпись подписки (название, поддержка) задай заново: vpn brand"
+    echo "  • Панель основного можно закрыть снаружи: vpn panel hide (у нод она должна оставаться открытой)"
+    echo "  • Проверка: vpn node; vpn check --local"
 }
 
 # ---------------------------------------------------------------- vpn trace
@@ -2612,6 +2761,7 @@ do_import() { # <файл|x-ui.db|-> | --from [user@]хост[:порт] | --lin
     if [[ -n "$d_ips" ]]; then env_set DEF_IPS "$d_ips"; fi
 
     local sd sb step=1 hp
+    if [[ -n "${IMPORT_NO_HINTS:-}" ]]; then echo "Импорт завершён: создано ${created:-0}, обновлено ${n_upd}."; return 0; fi
     sd=$(jq -r '.domains.self // empty' <<<"$bundle"); sb=$(jq -r '.domains.sub // empty' <<<"$bundle")
     echo
     if (( n_new + n_upd > 0 )); then echo "Готово. Пользователи, ключи, ID подписок, лимиты, сроки и трафик перенесены."; else echo "Готово."; fi
@@ -2665,6 +2815,10 @@ vpn node                                 — ноды (другие сервер
 vpn node add <адрес панели> <токен> [--name имя] — подключить сервер-ноду (адрес и токен: vpn node prepare на ноде)
 vpn node sync | del <имя>                — дотянуть новые серверы нод и всех пользователей / отключить ноду
 vpn node rename <имя> <новое имя>        — переименовать ноду (видно только в vpn node; подписку не трогает)
+vpn promote [--from root@IP] [--nodes root@IP,…] [--sub-link ссылка] [--yes]
+                                         — (на ноде) сделать этот сервер основным. --from: плановая смена, старый
+                                           основной по ssh отдаёт пользователей и становится нодой. Без --from: авария,
+                                           пользователи из копии на ноде. Остальные ноды перепривязываются по ssh
 vpn node prepare                         — (на новом сервере) сделать его нодой и показать команду для главного
 vpn trace [IP] [секунд]                  — запись подключений клиентов и разбор: дошло ли, ответил ли сервер
 vpn reality [auto|<домен>|<ip:443> <домен>] — маскировка Reality: показать / подобрать в сети хостера / задать
@@ -2706,6 +2860,9 @@ fastest) load_env; node_guard; do_fastest "$@" ;;
 trace) load_env; do_trace "$@" ;;
 http3) load_env; do_http3 "$@" ;;
 node) load_env; do_node "$@" ;;
+promote) load_env; do_promote "$@" ;;
+_role) load_env; if is_node; then echo node; else echo main; fi ;;
+_nodes) load_env; if is_node; then echo "[]"; else node_list_json | jq -c '[.[] | {name, address, port}]'; fi ;;
 export) load_env; do_export "$@" ;;
 import) load_env; do_import "$@" ;;
 _hop) hop_rules "${1:-up}" "${2:-20000-50000}" ;;
