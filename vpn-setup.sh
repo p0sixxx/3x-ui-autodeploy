@@ -78,7 +78,9 @@ free_port() {
 preflight() {
     log "Проверка сервера"
     [[ $EUID -eq 0 ]] || die "Запусти от root (sudo -i)"
-    . /etc/os-release
+    # os-release читаем в подоболочке: в нём есть SUPPORT_URL (help.ubuntu.com), который перетёр бы наш параметр
+    local ID VERSION_ID
+    read -r ID VERSION_ID < <(. /etc/os-release; echo "${ID:-?} ${VERSION_ID:-?}")
     case "$ID" in
         ubuntu) [[ "$VERSION_ID" == "24.04" ]] && ok "ОС: Ubuntu $VERSION_ID" || warn "ОС: Ubuntu $VERSION_ID (проверено на 24.04)";;
         debian) warn "ОС: Debian $VERSION_ID (проверено на Ubuntu 24.04)";;
