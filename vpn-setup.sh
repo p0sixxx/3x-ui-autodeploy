@@ -2166,6 +2166,15 @@ do_node() {
             fi
             if [[ -n "${FASTEST_ID:-}" ]]; then do_fastest off >/dev/null 2>&1 || true; fi
             env_set ROLE node
+        else
+            # уже нода: пользователи здесь — копии от прежнего основного. Новый основной пришлёт свои,
+            # а с копиями vpn node add откажется подключать сервер
+            local cl em
+            cl=$(api GET /clients/list); ok "$cl"; em=$(jq -c '[.obj[]?.email]' <<<"$cl")
+            if [[ "$em" != "[]" ]]; then
+                echo "Убираю копии пользователей от прежнего основного: $(jq -r 'join(", ")' <<<"$em")"
+                ok "$(api_json POST /clients/bulkDel "$(jq -nc --argjson e "$em" '{emails: $e}')")"
+            fi
         fi
         local t cc nm
         t=$(node_token)
