@@ -1961,7 +1961,7 @@ do_check() {
             [[ "$nst" == online ]] && r_ok "Нода ${nname} (${naddr}) в сети, ${nl} мс" || r_fail "Нода ${nname} (${naddr}): ${nst} — проверь сервер и его панель"
         done < <(jq -r '.[] | [.name, .address, (.status // "?"), (.latencyMs // 0 | tostring)] | @tsv' <<<"$nodes")
         local noff
-        noff=$(api GET /inbounds/list 2>/dev/null | jq -r --argjson nd "$nodes" '[.obj[]? | select(.nodeId != null and .enable == false) | .nodeId] | unique | .[] as $i
+        noff=$(api GET /inbounds/list 2>/dev/null | jq -r --argjson nd "$nodes" '[.obj[]? | select(.nodeId != null and (.excludeFromSub == true or .enable == false)) | .nodeId] | unique | .[] as $i
             | $nd[] | select(.id == $i) | .name' 2>/dev/null || true)
         for nname in $noff; do r_warn "Нода ${nname} выключена, её серверов нет в подписке — вернуть: vpn node on ${nname}"; done
         nids=$(node_inbound_ids 2>/dev/null || echo '[]')
@@ -2091,7 +2091,7 @@ do_node() {
         ids=$(api GET /inbounds/list)
         jq -r --argjson ib "$ids" '.[] | . as $n |
             "\(.name)  \(.address)  \(if .status == "online" then "в сети, \(.latencyMs) мс" else (.status // "?") end)  Xray \(.xrayVersion // "?")",
-            ($ib.obj[]? | select(.nodeId == $n.id) | "    \(.remark)  (\(.protocol), порт \(.port))\(if .enable == false then "  — выключен (vpn node on \($n.name))" else "" end)")' <<<"$nodes"
+            ($ib.obj[]? | select(.nodeId == $n.id) | "    \(.remark)  (\(.protocol), порт \(.port))\(if .excludeFromSub == true or .enable == false then "  — выключен (vpn node on \($n.name))" else "" end)")' <<<"$nodes"
         ;;
     off|on)
         node_guard
@@ -2100,8 +2100,11 @@ do_node() {
         nid=$(node_find "$key"); [[ -n "$nid" ]] || { echo "Нода «$key» не найдена (vpn node)"; exit 1; }
         [[ "$action" == off ]] && en=false
         ids=$(node_inbound_ids "$nid")
+        # «скрыть из подписки» (excludeFromSub) задаёт главный сервер; enable нода присылает свой при каждой синхронизации
         for id in $(jq -r '.[]' <<<"$ids"); do
-            ok "$(api_json POST "/inbounds/setEnable/$id" "{\"enable\": ${en}}")"; n=$((n + 1))
+            if [[ "$en" == false ]]; then inbound_patch "$id" '.excludeFromSub = true'
+            else inbound_patch "$id" '.excludeFromSub = false | .enable = true'; fi
+            n=$((n + 1))
         done
         if [[ "$action" == off ]]; then
             echo "Нода «$key» выключена: её серверы (${n}) убраны из подписки и из «Лучшего сервера». Пользователи и настройки сохранены."
