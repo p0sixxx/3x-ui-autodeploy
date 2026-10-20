@@ -752,6 +752,7 @@ do_limit() {
     esac
     if [[ -n "$DEV" ]] && (( DEV > 0 )); then hwid_note; fi
     if [[ -n "$IPS" ]] && (( IPS > 0 )); then fail2ban_note; fi
+    if [[ -n "$RESET" ]]; then refill_sync >/dev/null 2>&1 || true; fi
 }
 do_devices() {
     local name=${1:-} r lim
@@ -996,6 +997,7 @@ self_nginx() { # <домен> <порт>
     location ~ \"^/[A-Za-z0-9_-]{6,64}\$\" {
         rewrite ^/(.*)\$ ${SUB_PATH%/}/\$1 break;
         proxy_pass https://127.0.0.1:${SUB_PORT};
+        add_header Subscription-Refill-Date \$vpn_refill always;
         proxy_set_header Host \$host;
         proxy_set_header X-Forwarded-Host \$host;
         proxy_set_header X-Forwarded-Proto https;
@@ -1005,15 +1007,31 @@ self_nginx() { # <домен> <порт>
     # страница подписки (html=1) и ссылки со старым путём
     location ^~ ${SUB_PATH%/}/ {
         proxy_pass https://127.0.0.1:${SUB_PORT};
+        add_header Subscription-Refill-Date \$vpn_refill always;
         proxy_set_header Host \$host;
         proxy_set_header X-Forwarded-Host \$host;
         proxy_set_header X-Forwarded-Proto https;
         proxy_set_header X-Real-IP \$remote_addr;
     }"
     fi
+    local refill_map=""
+    if [[ -n "$sub_loc" ]]; then
+        [[ -e "$REFILL_MAP" ]] || : > "$REFILL_MAP"
+        refill_map="
+# дата следующего обнуления трафика пользователя (vpn limit --monthly) — заголовок Subscription-Refill-Date;
+# файл пересчитывает vpn _refill (cron раз в час)
+map \$uri \$vpn_refill {
+    default \"\";
+    include $REFILL_MAP;
+}
+"
+        printf '7 * * * * root /usr/local/bin/vpn _refill >/dev/null 2>&1\n' > /etc/cron.d/vpn-refill
+    else
+        rm -f /etc/cron.d/vpn-refill
+    fi
     cat > "$SELF_NGINX" <<NGX
 # vpn reality self — сайт-маскировка Reality, доступен только через Xray (порт 443)
-server {
+${refill_map}server {
     $h2
     server_name $1;
     server_tokens off;
@@ -1031,6 +1049,55 @@ NGX
     nginx -t >/dev/null 2>&1 || { nginx -t; echo "Конфиг nginx с ошибкой: $SELF_NGINX"; exit 1; }
     systemctl enable nginx >/dev/null 2>&1 || true
     systemctl restart nginx >/dev/null 2>&1 || { echo "nginx не запустился: journalctl -u nginx -n 30"; exit 1; }
+    if [[ -n "$sub_loc" ]]; then refill_sync >/dev/null 2>&1 || true; fi
+}
+REFILL_MAP=/etc/vpn/refill.map
+refill_sync() { # пересчитать даты обнуления (часовой пояс панели) → $REFILL_MAP, reload nginx при изменении
+    [[ -n "${SUB_SHORT:-}" && -n "${SUB_PATH:-}" && -f "$SELF_NGINX" ]] || return 0
+    grep -q vpn_refill "$SELF_NGINX" || return 0
+    local cl tz new
+    cl=$(api GET /clients/list); ok "$cl"
+    tz=$(api POST /setting/all | jq -r '.obj.timeLocation // ""' 2>/dev/null || true)
+    new=$(python3 -I -c '
+import calendar, datetime, json, sys
+try:
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(sys.argv[1]) if sys.argv[1] not in ("", "Local") else None
+except Exception:
+    tz = None
+now = datetime.datetime.now(tz).astimezone(tz) if tz else datetime.datetime.now().astimezone()
+tz = now.tzinfo
+mid = now.replace(hour=0, minute=0, second=0, microsecond=0)
+def nxt(kind, day):
+    if kind == "monthly":
+        for add in range(3):
+            y = now.year + (now.month - 1 + add) // 12; m = (now.month - 1 + add) % 12 + 1
+            t = datetime.datetime(y, m, min(day or 1, calendar.monthrange(y, m)[1]), tzinfo=tz)
+            if t > now: return t
+    if kind == "daily": return mid + datetime.timedelta(days=1)
+    if kind == "weekly": return mid + datetime.timedelta(days=(6 - now.weekday()) or 7)
+    if kind == "hourly": return now.replace(minute=0, second=0, microsecond=0) + datetime.timedelta(hours=1)
+    return None
+pre = sys.argv[2]
+for c in json.load(sys.stdin).get("obj") or []:
+    sid, t = c.get("subId") or "", nxt(c.get("trafficReset") or "never", c.get("trafficResetDay") or 1)
+    if t and sid and all(ch.isalnum() or ch in "_-" for ch in sid):
+        print("\"%s/%s\" %d;" % (pre, sid, int(t.timestamp())))
+' "$tz" "${SUB_PATH%/}" <<<"$cl") || return 1
+    if [[ "$new" != "$(cat "$REFILL_MAP" 2>/dev/null)" ]]; then
+        printf '%s\n' "$new" > "$REFILL_MAP.tmp" && mv "$REFILL_MAP.tmp" "$REFILL_MAP"
+        nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
+    fi
+}
+do_refill() { # vpn refill — включить заголовок даты обнуления (для старых установок) и пересчитать
+    if [[ -z "${SUB_SHORT:-}" || -z "${SELF_DOMAIN:-}" ]]; then
+        echo "Дату обнуления в подписке можно показать только с короткой ссылкой (https://домен/ID):"
+        echo "  vpn reality self <домен> и vpn sub-domain <тот же домен>"; exit 1
+    fi
+    if ! grep -q vpn_refill "$SELF_NGINX" 2>/dev/null; then self_nginx "$SELF_DOMAIN" "$SELF_PORT"; fi
+    refill_sync
+    echo "Дата обнуления трафика отдаётся в подписке (заголовок Subscription-Refill-Date) пользователям с $(grep -c . "$REFILL_MAP" 2>/dev/null || echo 0) обнулением по расписанию."
+    echo "Обновляется сама раз в час. Клиенты покажут её после обновления подписки (если умеют, например Happ)."
 }
 self_reload() { # команда после выпуска/продления сертификата Reality-домена
     local c="systemctl reload nginx"
@@ -2885,6 +2952,8 @@ vpn del <имя>                            — удалить
 vpn panel [hide|show|status]             — адрес и логин панели; hide — закрыть панель снаружи (доступ через ssh-туннель)
 vpn check [--local]                      — полная диагностика (--local: без проверки снаружи)
 vpn repair                               — починить адрес в ссылках своих серверов (после vpn promote)
+vpn refill                               — показывать в подписке дату обнуления трафика (--monthly); нужна
+                                           короткая ссылка, сама включается при vpn reality self / sub-domain
 vpn export [файл]                        — выгрузить всех пользователей (ключи, ID подписок, лимиты, сроки, трафик) в файл
 vpn import <файл экспорта | x-ui.db> | --from [user@]хост[:порт] | --links <файл> [--update] [--no-links] [--no-brand] [--yes]
                                          — перенос со старого сервера на этот (новый, главный): пользователи с теми же
@@ -2945,6 +3014,8 @@ http3) load_env; do_http3 "$@" ;;
 node) load_env; do_node "$@" ;;
 promote) load_env; do_promote "$@" ;;
 repair) load_env; node_guard; do_repair ;;
+refill) load_env; node_guard; do_refill ;;
+_refill) load_env; is_node || refill_sync ;;
 _role) load_env; if is_node; then echo node; else echo main; fi ;;
 _nodes) load_env; if is_node; then echo "[]"; else node_list_json | jq -c '[.[] | {name, address, port}]'; fi ;;
 export) load_env; do_export "$@" ;;
@@ -2959,7 +3030,7 @@ add)
     dev=${DEV:-${DEF_DEVICES:-0}}; ips=${IPS:-${DEF_IPS:-0}}
     add_client "$1" "$2" "$3" "${4:-}" "$dev" "$ips" "${SUBID:-}"
     echo "Создан: $1 (трафик: $([[ $2 == 0 ]] && echo без лимита || echo "$2 ГБ"), срок: $([[ $3 == 0 ]] && echo бессрочно || echo "$3 дн."), $(limits_text "$dev" "$ips"))"
-    if [[ "${RESET:-never}" != never && "$2" != 0 ]]; then echo "Лимит ${2} ГБ — на месяц: $(reset_text "$RESET" "$RESET_DAY")"; fi
+    if [[ "${RESET:-never}" != never && "$2" != 0 ]]; then echo "Лимит ${2} ГБ — на месяц: $(reset_text "$RESET" "$RESET_DAY")"; refill_sync >/dev/null 2>&1 || true; fi
     if (( dev > 0 )); then hwid_note; fi
     if (( ips > 0 )); then fail2ban_note; fi
     show_link "$1"
