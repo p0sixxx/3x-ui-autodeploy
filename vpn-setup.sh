@@ -653,24 +653,31 @@ show_link() {
 save_client() { # полное обновление (update заменяет запись целиком)
     local c=$1 name; name=$(jq -r .email <<<"$c")
     ok "$(api_json POST "/clients/update/$name" "$(jq -c '{email, id: .uuid, auth, subId, flow, limitIp, limitHwid,
-        tgId, comment, reset, enable, totalGB, expiryTime}' <<<"$c")")"
+        tgId, comment, reset, enable, totalGB, expiryTime,
+        trafficReset: (.trafficReset // "never"), trafficResetDay: (.trafficResetDay // 1)}' <<<"$c")")"
 }
 
-add_client() { # add_client <имя> <ГБ> <дней> [комментарий] [устройств] [IP] [ID подписки]
-    local exp=0
+add_client() { # add_client <имя> <ГБ> <дней> [комментарий] [устройств] [IP] [ID подписки]; RESET/RESET_DAY из parse_limits
+    local exp=0 tr=${RESET:-never} td=${RESET_DAY:-1}
     [[ "$3" != 0 ]] && exp=$(( $(now_ms) + ${3%.*} * 86400000 ))
     ok "$(api_json POST /clients/add "$(jq -n --arg e "$1" --arg sub "${7:-$(openssl rand -hex 8)}" --arg gb "$2" \
         --argjson exp "$exp" --arg cm "${4:-}" --argjson ib "$INBOUNDS" --argjson G $GiB \
-        --argjson dev "${5:-0}" --argjson ips "${6:-0}" \
+        --argjson dev "${5:-0}" --argjson ips "${6:-0}" --arg tr "$tr" --argjson td "$td" \
         '{client: {email: $e, subId: $sub, flow: "xtls-rprx-vision", totalGB: (($gb|tonumber) * $G | floor),
-          expiryTime: $exp, limitIp: $ips, limitHwid: $dev, tgId: 0, comment: $cm, enable: true}, inboundIds: $ib}')")"
+          expiryTime: $exp, limitIp: $ips, limitHwid: $dev, tgId: 0, comment: $cm, enable: true,
+          trafficReset: $tr, trafficResetDay: $td}, inboundIds: $ib}')")"
 }
 
 # ---------------------------------------------------------------- лимиты устройств и IP
-parse_limits() { # вынимает --devices N и --ips N, остальные аргументы → REST
-    DEV=""; IPS=""; SUBID=""; REST=()
+parse_limits() { # вынимает --devices N, --ips N, --sub-id, --monthly/--no-monthly/--reset-day N; остальное → REST
+    DEV=""; IPS=""; SUBID=""; RESET=""; RESET_DAY=""; REST=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --monthly) RESET=monthly; shift ;;
+            --no-monthly) RESET=never; shift ;;
+            --reset-day)
+                [[ $# -ge 2 && "$2" =~ ^([1-9]|[12][0-9]|3[01])$ ]] || { echo "--reset-day: день месяца 1-31"; exit 1; }
+                RESET=monthly; RESET_DAY=$2; shift 2 ;;
             --sub-id)
                 [[ $# -ge 2 && "$2" =~ ^[A-Za-z0-9_-]{3,64}$ ]] || { echo "--sub-id: нужен ID подписки (последняя часть старой ссылки, латиница, цифры, _ -)"; exit 1; }
                 SUBID=$2; shift 2 ;;
@@ -681,6 +688,16 @@ parse_limits() { # вынимает --devices N и --ips N, остальные �
             *) REST+=("$1"); shift ;;
         esac
     done
+    if [[ "$RESET" == monthly && -z "$RESET_DAY" ]]; then RESET_DAY=$(date +%-d); fi
+}
+reset_text() { # <trafficReset> <день>
+    case "${1:-never}" in
+        monthly) echo "трафик обнуляется ${2:-1}-го числа каждого месяца" ;;
+        weekly) echo "трафик обнуляется каждую неделю" ;;
+        daily) echo "трафик обнуляется каждый день" ;;
+        hourly) echo "трафик обнуляется каждый час" ;;
+        *) echo "лимит трафика на весь срок" ;;
+    esac
 }
 limits_text() { # <устройств> <IP>
     local d="без лимита" i="без лимита"
@@ -701,19 +718,25 @@ set_limits() { # <имя> — применяет DEV/IPS
     local c; c=$(get_client "$1")
     if [[ -n "$DEV" ]]; then c=$(jq --argjson d "$DEV" '.limitHwid = $d' <<<"$c"); fi
     if [[ -n "$IPS" ]]; then c=$(jq --argjson i "$IPS" '.limitIp = $i' <<<"$c"); fi
+    if [[ -n "$RESET" ]]; then c=$(jq --arg r "$RESET" --argjson d "${RESET_DAY:-1}" '.trafficReset = $r | .trafficResetDay = $d' <<<"$c"); fi
     save_client "$c"
+}
+client_text() { # <имя> → «устройств: …, одновременных IP: …; трафик …»
+    local c; c=$(get_client "$1")
+    echo "$(limits_text "$(jq -r '.limitHwid // 0' <<<"$c")" "$(jq -r '.limitIp // 0' <<<"$c")"); $(reset_text "$(jq -r '.trafficReset // "never"' <<<"$c")" "$(jq -r '.trafficResetDay // 1' <<<"$c")")"
 }
 do_limit() {
     parse_limits "$@"; set -- "${REST[@]+"${REST[@]}"}"
     local who=${1:-} c e n=0
     [[ -n "$who" ]] || { usage; exit 1; }
-    if [[ -z "$DEV" && -z "$IPS" ]]; then
+    if [[ -z "$DEV" && -z "$IPS" && -z "$RESET" ]]; then
         if [[ "$who" == default ]]; then echo "Для новых пользователей: $(limits_text "${DEF_DEVICES:-0}" "${DEF_IPS:-0}")"
-        else check_name "$who"; c=$(get_client "$who"); echo "$who: $(limits_text "$(jq -r '.limitHwid // 0' <<<"$c")" "$(jq -r '.limitIp // 0' <<<"$c")")"; fi
+        else check_name "$who"; echo "$who: $(client_text "$who")"; fi
         return
     fi
     case "$who" in
         default)
+            if [[ -n "$RESET" ]]; then echo "Обнуление трафика задаётся при создании: vpn add … --monthly"; exit 1; fi
             if [[ -n "$DEV" ]]; then env_set DEF_DEVICES "$DEV"; fi
             if [[ -n "$IPS" ]]; then env_set DEF_IPS "$IPS"; fi
             echo "Для новых пользователей: $(limits_text "${DEF_DEVICES:-0}" "${DEF_IPS:-0}")" ;;
@@ -725,8 +748,7 @@ do_limit() {
             echo "Применено к ${n} пользователям (кроме me)." ;;
         *)
             check_name "$who"; set_limits "$who"
-            c=$(get_client "$who")
-            echo "$who: $(limits_text "$(jq -r '.limitHwid // 0' <<<"$c")" "$(jq -r '.limitIp // 0' <<<"$c")")" ;;
+            echo "$who: $(client_text "$who")" ;;
     esac
     if [[ -n "$DEV" ]] && (( DEV > 0 )); then hwid_note; fi
     if [[ -n "$IPS" ]] && (( IPS > 0 )); then fail2ban_note; fi
@@ -2844,12 +2866,14 @@ do_import() { # <файл|x-ui.db|-> | --from [user@]хост[:порт] | --lin
 
 usage() {
     cat <<EOF
-vpn add <имя> <ГБ> <дней> [комментарий] [--devices N] [--ips N] [--sub-id ID]
+vpn add <имя> <ГБ> <дней> [комментарий] [--devices N] [--ips N] [--sub-id ID] [--monthly] [--reset-day N]
                                          — новый пользователь (0 = без лимита / бессрочно); --sub-id — вернуть
                                            пользователю прежний ID подписки (последняя часть старой ссылки)
-vpn limit <имя|all|default> [--devices N] [--ips N]
+vpn limit <имя|all|default> [--devices N] [--ips N] [--monthly | --no-monthly] [--reset-day N]
                                          — лимит устройств (по ID устройства) и одновременных IP;
-                                           all — всем, кроме me; default — для новых пользователей
+                                           all — всем, кроме me; default — для новых пользователей;
+                                           --monthly — ГБ на месяц: трафик обнуляется каждый месяц
+                                           (в день --reset-day, по умолчанию — сегодняшнее число)
 vpn devices <имя> [reset|<номер>]        — устройства пользователя: список / сбросить все / удалить одно
 vpn list                                 — все пользователи, трафик, сроки
 vpn link <имя>                           — ссылка подписки + QR
@@ -2935,6 +2959,7 @@ add)
     dev=${DEV:-${DEF_DEVICES:-0}}; ips=${IPS:-${DEF_IPS:-0}}
     add_client "$1" "$2" "$3" "${4:-}" "$dev" "$ips" "${SUBID:-}"
     echo "Создан: $1 (трафик: $([[ $2 == 0 ]] && echo без лимита || echo "$2 ГБ"), срок: $([[ $3 == 0 ]] && echo бессрочно || echo "$3 дн."), $(limits_text "$dev" "$ips"))"
+    if [[ "${RESET:-never}" != never && "$2" != 0 ]]; then echo "Лимит ${2} ГБ — на месяц: $(reset_text "$RESET" "$RESET_DAY")"; fi
     if (( dev > 0 )); then hwid_note; fi
     if (( ips > 0 )); then fail2ban_note; fi
     show_link "$1"
@@ -2950,7 +2975,9 @@ list)
     jq -r --argjson G $GiB --arg hc "$HC_USER" '.obj[] | select(.email != $hc) | [ .email,
         (if .enable and (.traffic.enable // true) then "да" else "нет" end),
         ((((.traffic.up // 0) + (.traffic.down // 0)) / $G * 100 | floor) / 100 | tostring) + " ГБ",
-        (if .totalGB > 0 then ((.totalGB / $G * 100 | floor) / 100 | tostring) + " ГБ" else "∞" end),
+        (if .totalGB > 0 then ((.totalGB / $G * 100 | floor) / 100 | tostring) + " ГБ"
+            + (if .trafficReset == "monthly" then "/мес(\(.trafficResetDay // 1))" elif (.trafficReset // "never") != "never" then "/" + .trafficReset else "" end)
+         else "∞" end),
         (.expiryTime // 0 | tostring),
         ((if (.limitHwid // 0) > 0 then (.limitHwid | tostring) else "∞" end) + "/" + (if (.limitIp // 0) > 0 then (.limitIp | tostring) else "∞" end)),
         (if (.comment // "") == "" then "-" else .comment end) ] | @tsv' <<<"$r" |
