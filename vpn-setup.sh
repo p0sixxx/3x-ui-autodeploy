@@ -1089,6 +1089,46 @@ for c in json.load(sys.stdin).get("obj") or []:
         nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
     fi
 }
+XUI_DB=${XUI_DB:-/etc/x-ui/x-ui.db}
+do_traffic() { # [имя] — трафик пользователей по серверам: этот сервер и каждая нода (с последнего обнуления)
+    local who=${1:-}
+    [[ -z "$who" ]] || check_name "$who"
+    [[ -r "$XUI_DB" ]] || { echo "Нет базы $XUI_DB"; exit 1; }
+    python3 -I - "$XUI_DB" "$HC_USER" "$who" <<'PYT'
+import sqlite3, sys
+db, hc, who = sys.argv[1:4]
+c = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=10)
+q = lambda sql, *a: c.execute(sql, a).fetchall()
+nodes = q("SELECT id, name FROM nodes ORDER BY id")
+tot = {e: (u or 0) + (d or 0) for e, u, d in q("SELECT email, up, down FROM client_traffics")}
+per = {}
+try:
+    for nid, e, u, d in q("SELECT node_id, email, up, down FROM node_client_traffics"):
+        per.setdefault(e, {})[nid] = (u or 0) + (d or 0)
+except sqlite3.OperationalError:
+    pass
+emails = [e for e in tot if e != hc and (not who or e == who)]
+if who and not emails:
+    sys.exit("Пользователь %s не найден" % who)
+emails.sort(key=lambda e: -tot[e])
+G = 1024 ** 3
+f = lambda b: "%.2f" % (b / G)
+head = ["ИМЯ", "ВСЕГО", "ОСНОВНОЙ"] + [n for _, n in nodes]
+rows, sums = [], [0] * (len(head) - 1)
+for e in emails:
+    nv = [per.get(e, {}).get(nid, 0) for nid, _ in nodes]
+    main = max(tot[e] - sum(nv), 0)
+    vals = [tot[e], main] + nv
+    sums = [a + b for a, b in zip(sums, vals)]
+    rows.append([e] + [f(v) for v in vals])
+if not who and len(rows) > 1:
+    rows.append(["ИТОГО"] + [f(v) for v in sums])
+w = [max(len(r[i]) for r in [head] + rows) for i in range(len(head))]
+for r in [head] + rows:
+    print("  ".join(x.ljust(w[i]) if i == 0 else x.rjust(w[i]) for i, x in enumerate(r)))
+print("\nГБ с последнего обнуления трафика пользователя (vpn reset/renew или --monthly). Ноды считаются с момента подключения.")
+PYT
+}
 do_refill() { # vpn refill — включить заголовок даты обнуления (для старых установок) и пересчитать
     if [[ -z "${SUB_SHORT:-}" || -z "${SELF_DOMAIN:-}" ]]; then
         echo "Дату обнуления в подписке можно показать только с короткой ссылкой (https://домен/ID):"
@@ -2952,6 +2992,7 @@ vpn del <имя>                            — удалить
 vpn panel [hide|show|status]             — адрес и логин панели; hide — закрыть панель снаружи (доступ через ssh-туннель)
 vpn check [--local]                      — полная диагностика (--local: без проверки снаружи)
 vpn repair                               — починить адрес в ссылках своих серверов (после vpn promote)
+vpn traffic [имя]                        — трафик пользователей по серверам: основной и каждая нода (ГБ)
 vpn refill                               — показывать в подписке дату обнуления трафика (--monthly); нужна
                                            короткая ссылка, сама включается при vpn reality self / sub-domain
 vpn export [файл]                        — выгрузить всех пользователей (ключи, ID подписок, лимиты, сроки, трафик) в файл
@@ -3015,6 +3056,7 @@ node) load_env; do_node "$@" ;;
 promote) load_env; do_promote "$@" ;;
 repair) load_env; node_guard; do_repair ;;
 refill) load_env; node_guard; do_refill ;;
+traffic) load_env; node_guard; do_traffic "$@" ;;
 _refill) load_env; is_node || refill_sync ;;
 _role) load_env; if is_node; then echo node; else echo main; fi ;;
 _nodes) load_env; if is_node; then echo "[]"; else node_list_json | jq -c '[.[] | {name, address, port}]'; fi ;;
