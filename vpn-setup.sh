@@ -2192,10 +2192,14 @@ node_sync() { # все пользователи → на все серверы �
     env_set INBOUNDS "$(jq -c --argjson a "$all" '[.[] | select(. as $x | $a | index($x))]' <<<"$INBOUNDS")"
     ids=$(node_inbound_ids)
     emails=$(all_emails)
+    local ibl nmap nname
+    ibl=$(api GET /inbounds/list); nmap=$(node_list_json)
     for id in $(jq -r '.[]' <<<"$ids"); do
         if ! jq -e --argjson id "$id" 'index($id)' <<<"$INBOUNDS" >/dev/null; then inbounds_add "$id"; new=$((new + 1)); fi
         cur=$(api GET "/inbounds/get/$id" | jq -c '[.obj.settings | (if type == "string" then fromjson else . end) | .clients[]?.email]')
-        miss=$(jq -c --argjson c "$cur" '[.[] | select(. as $e | $c | index($e) | not)]' <<<"$emails")
+        nname=$(jq -r --argjson id "$id" --argjson nd "$nmap" '.obj[]? | select(.id == $id) | .nodeId as $n | $nd[] | select(.id == $n) | .name' <<<"$ibl")
+        miss=$(jq -c --argjson c "$cur" --argjson bl "${NODE_BLOCK:-[]}" --arg n "$nname" \
+            '[.[] | select(. as $e | ($c | index($e) | not) and ($bl | index($e + ":" + $n) | not))]' <<<"$emails")
         if [[ "$miss" != "[]" ]]; then
             ok "$(api_json POST /clients/bulkAttach "$(jq -nc --argjson e "$miss" --argjson i "[$id]" '{emails: $e, inboundIds: $i}')")"
         fi
@@ -2218,9 +2222,31 @@ do_node() {
         nodes=$(node_list_json)
         if [[ "$nodes" == "[]" ]]; then echo "Нод нет. Добавить: vpn node add <адрес панели ноды> <токен> (см. vpn help)"; return; fi
         ids=$(api GET /inbounds/list)
-        jq -r --argjson ib "$ids" '.[] | . as $n |
+        jq -r --argjson ib "$ids" --argjson bl "${NODE_BLOCK:-[]}" '.[] | . as $n |
             "\(.name)  \(.address)  \(if .status == "online" then "в сети, \(.latencyMs) мс" else (.status // "?") end)  Xray \(.xrayVersion // "?")",
+            (($bl | map(select(endswith(":" + $n.name)) | sub(":[^:]*$"; ""))) | select(length > 0) | "    без доступа: \(join(", ")) (vpn node unblock <имя> \($n.name))"),
             ($ib.obj[]? | select(.nodeId == $n.id) | "    \(.remark)  (\(.protocol), порт \(.port))\(if .excludeFromSub == true or .enable == false then "  — выключен (vpn node on \($n.name))" else "" end)")' <<<"$nodes"
+        ;;
+    block|unblock)
+        node_guard
+        local user=${1:-} key=${2:-} nid ids pair bl
+        [[ -n "$user" && -n "$key" ]] || { echo "Использование: vpn node ${action} <пользователь> <нода>"; exit 1; }
+        check_name "$user"; get_client "$user" >/dev/null
+        nid=$(node_find "$key"); [[ -n "$nid" ]] || { echo "Нода «$key» не найдена (vpn node)"; exit 1; }
+        key=$(node_list_json | jq -r --argjson i "$nid" '.[] | select(.id == $i) | .name')
+        ids=$(node_inbound_ids "$nid"); pair="${user}:${key}"; bl=${NODE_BLOCK:-[]}
+        if [[ "$action" == block ]]; then
+            ok "$(api_json POST /clients/bulkDetach "$(jq -nc --arg e "$user" --argjson i "$ids" '{emails: [$e], inboundIds: $i}')")"
+            env_set NODE_BLOCK "$(jq -c --arg p "$pair" '. + [$p] | unique' <<<"$bl")"
+            if [[ -n "${FASTEST_ID:-}" ]]; then fastest_sync; fi
+            echo "${user}: серверы ноды «${key}» убраны из его подписки (и из «Лучшего сервера»). Остальные пользователи не затронуты."
+            echo "Вернуть: vpn node unblock ${user} ${key}. Пользователю — обновить подписку."
+        else
+            ok "$(api_json POST /clients/bulkAttach "$(jq -nc --arg e "$user" --argjson i "$ids" '{emails: [$e], inboundIds: $i}')")"
+            env_set NODE_BLOCK "$(jq -c --arg p "$pair" 'map(select(. != $p))' <<<"$bl")"
+            if [[ -n "${FASTEST_ID:-}" ]]; then fastest_sync; fi
+            echo "${user}: серверы ноды «${key}» снова в его подписке. Пользователю — обновить подписку."
+        fi
         ;;
     off|on)
         node_guard
@@ -2302,7 +2328,9 @@ do_node() {
         # выключенная нода: панель удаляет свои копии её серверов, не трогая саму ноду; потом — саму ноду
         ok "$(api_json POST "/nodes/setEnable/$nid" '{"enable": false}')"
         for id in $(jq -r '.[]' <<<"$ids"); do ok "$(api POST "/inbounds/del/$id")"; inbounds_del "$id"; done
+        local dname; dname=$(node_list_json | jq -r --argjson i "$nid" '.[] | select(.id == $i) | .name')
         ok "$(api POST "/nodes/del/$nid")"
+        env_set NODE_BLOCK "$(jq -c --arg o ":$dname" 'map(select(endswith($o) | not))' <<<"${NODE_BLOCK:-[]}")"
         if [[ -n "${FASTEST_ID:-}" ]]; then fastest_sync; fi
         echo "Нода «$key» отключена: пользователи сняты с её серверов, серверы убраны из подписки."
         echo "Сама нода не тронута (её 3x-ui и серверы остались). В клиентах обнови подписку."
@@ -2316,12 +2344,16 @@ do_node() {
         taken=$(node_list_json | jq -r --arg n "$new" --argjson id "$nid" '.[] | select(.name == $n and .id != $id) | .name' | head -1)
         [[ -z "$taken" ]] || { echo "Имя «$new» уже занято другой нодой"; exit 1; }
         r=$(api GET "/nodes/get/$nid"); ok "$r"
+        local oldname; oldname=$(jq -r '.obj.name' <<<"$r")
         # все поля как есть, меняется только имя (и remark, если он совпадал с именем); токен не передаём — панель его сохранит
         body=$(jq -c --arg n "$new" '.obj | {id, name: $n, remark: (if (.remark // "") == "" or .remark == .name then $n else .remark end),
             scheme, address, port, basePath, enable, allowPrivateAddress, tlsVerifyMode, pinnedCertSha256: (.pinnedCertSha256 // ""),
             inboundSyncMode, inboundTags: (.inboundTags // []), outboundTag: (.outboundTag // "")}' <<<"$r")
         r=$(api_json POST "/nodes/update/$nid" "$body")
         jq -e '.success == true' >/dev/null 2>&1 <<<"$r" || { echo "Панель не приняла новое имя: $(jq -r '.msg // .' <<<"$r" 2>/dev/null) (нода должна быть в сети: vpn node)"; exit 1; }
+        if [[ -n "${NODE_BLOCK:-}" && "${NODE_BLOCK}" != "[]" ]]; then   # vpn node block: исключения хранятся по имени ноды
+            env_set NODE_BLOCK "$(jq -c --arg o "$oldname" --arg n "$new" 'map(if endswith(":" + $o) then (sub(":[^:]*$"; "") + ":" + $n) else . end)' <<<"$NODE_BLOCK")"
+        fi
         echo "Нода «$key» теперь называется «$new». Серверы, пользователи и подписка не меняются."
         ;;
     prepare)
@@ -3008,6 +3040,7 @@ vpn node add <адрес панели> <токен> [--name имя] — подк
 vpn node sync | del <имя>                — дотянуть новые серверы нод и всех пользователей / отключить ноду
 vpn node rename <имя> <новое имя>        — переименовать ноду (видно только в vpn node; подписку не трогает)
 vpn node off|on <имя>                    — временно убрать серверы ноды из подписки / вернуть
+vpn node block|unblock <пользователь> <нода> — убрать ноду из подписки одного пользователя / вернуть
 vpn promote [--from root@IP] [--nodes root@IP,…] [--sub-link ссылка] [--yes]
                                          — (на ноде) сделать этот сервер основным. --from: плановая смена, старый
                                            основной по ssh отдаёт пользователей и становится нодой. Без --from: авария,
@@ -3133,7 +3166,9 @@ off|on)
     save_client "$(jq --argjson en $en '.enable = $en' <<<"$(get_client "$1")")"
     echo "$1: $([[ $en == true ]] && echo включён || echo отключён)"
     ;;
-del) load_env; node_guard; check_name "${1:-}"; ok "$(api POST "/clients/del/$1")"; echo "Удалён: $1" ;;
+del) load_env; node_guard; check_name "${1:-}"; ok "$(api POST "/clients/del/$1")"
+    if [[ -n "${NODE_BLOCK:-}" ]]; then env_set NODE_BLOCK "$(jq -c --arg u "$1:" 'map(select(startswith($u) | not))' <<<"$NODE_BLOCK")"; fi
+    echo "Удалён: $1" ;;
 panel) load_env; do_panel "$@" ;;
 check) load_env; if [[ "${1:-}" == --local ]]; then do_check no; else do_check yes; fi ;;
 *) usage ;;
