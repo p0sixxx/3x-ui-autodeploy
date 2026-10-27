@@ -1089,6 +1089,50 @@ for c in json.load(sys.stdin).get("obj") or []:
         nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
     fi
 }
+panel_restart() {
+    systemctl restart x-ui
+    local i
+    for i in $(seq 1 20); do api GET /server/status 2>/dev/null | jq -e '.success == true' >/dev/null 2>&1 && break; sleep 1; done
+    (( i < 20 )) || echo "Панель долго поднимается — проверь: vpn check --local"
+}
+do_fragment() { # on [--packets P] [--length L] [--delay D] | off | status — фрагментация TLS ClientHello у клиентов
+    local act=${1:-status}; [[ $# -gt 0 ]] && shift
+    local all upd pk=tlshello ln=100-200 dl=10-20 a incy=1
+    all=$(api POST /setting/all); ok "$all"
+    case "$act" in
+    on)
+        while [[ $# -gt 0 ]]; do a=$1; shift; case "$a" in
+            --packets) pk=${1:-}; shift ;; --length) ln=${1:-}; shift ;; --delay) dl=${1:-}; shift ;;
+            *) echo "Неизвестный параметр: $a"; exit 1 ;; esac; done
+        [[ "$pk" =~ ^(tlshello|[0-9]+-[0-9]+)$ ]] || { echo "--packets: tlshello или диапазон пакетов, например 1-3"; exit 1; }
+        [[ "$ln" =~ ^[0-9]+-[0-9]+$ && "$dl" =~ ^[0-9]+-[0-9]+$ ]] || { echo "--length и --delay — диапазоны, например 100-200 и 10-20"; exit 1; }
+        # INCY с «Лучшим сервером» получает JSON-подписку с маской — свою фрагментацию ему не включаем, чтобы не резать дважды
+        if [[ -n "${FASTEST_ID:-}" && ",${FASTEST_CLIENTS:-$FASTEST_DEFAULT_CLIENTS}," == *,incy,* ]]; then incy=0; fi
+        upd=$(jq --arg p "$pk" --arg l "$ln" --arg d "$dl" --argjson incy "$incy" '.obj
+            | .subJsonFinalMask = ({tcp: [{type: "fragment", settings: {packets: $p, lengths: [$l], delays: [$d]}}]} | tojson)
+            | if $incy == 1 then .subIncyAppAutoDetect = true | .subIncyFragmentationEnable = "1"
+                | .subIncyFragmentLength = $l | .subIncyFragmentInterval = $d | .subIncyFragmentPackets = $p
+              else .subIncyFragmentationEnable = "" end' <<<"$all")
+        ok "$(api_json POST /setting/update "$upd")"
+        echo "Фрагментация включена: пакеты ${pk}, куски ${ln} байт, пауза ${dl} мс. Перезапускаю панель…"
+        panel_restart
+        echo "Работает в клиентах с JSON-подпиской (${FASTEST_CLIENTS:-$FASTEST_DEFAULT_CLIENTS})$( (( incy )) && echo " и в INCY (через его настройку фрагментации)")."
+        [[ -n "${FASTEST_ID:-}" ]] || echo "JSON-подписку клиенты получают при включённом «Лучшем сервере»: vpn fastest on"
+        echo "Касается только TCP (VLESS, XHTTP); Hysteria2 — UDP, её не трогает. Клиентам — обновить подписку. Проверка: vpn check --local"
+        ;;
+    off)
+        upd=$(jq '.obj | .subJsonFinalMask = "" | .subIncyFragmentationEnable = ""' <<<"$all")
+        ok "$(api_json POST /setting/update "$upd")"
+        panel_restart
+        echo "Фрагментация выключена (в INCY снова решает его собственная настройка). Клиентам — обновить подписку."
+        ;;
+    status)
+        local fm; fm=$(jq -r '.obj.subJsonFinalMask // ""' <<<"$all")
+        if [[ -n "$fm" ]]; then echo "Фрагментация включена: $(jq -c '.tcp[0].settings' <<<"$fm" 2>/dev/null || echo "$fm")$( [[ "$(jq -r '.obj.subIncyFragmentationEnable // ""' <<<"$all")" == 1 ]] && echo "; в INCY — через его настройку")"
+        else echo "Фрагментация выключена. Включить: vpn fragment on"; fi ;;
+    *) echo "Использование: vpn fragment on [--packets tlshello] [--length 100-200] [--delay 10-20] | off | status"; exit 1 ;;
+    esac
+}
 XUI_DB=${XUI_DB:-/etc/x-ui/x-ui.db}
 do_traffic() { # [имя] — трафик пользователей по серверам: этот сервер и каждая нода (с последнего обнуления)
     local who=${1:-}
@@ -3024,6 +3068,8 @@ vpn del <имя>                            — удалить
 vpn panel [hide|show|status]             — адрес и логин панели; hide — закрыть панель снаружи (доступ через ssh-туннель)
 vpn check [--local]                      — полная диагностика (--local: без проверки снаружи)
 vpn repair                               — починить адрес в ссылках своих серверов (после vpn promote)
+vpn fragment on|off|status [--packets tlshello] [--length 100-200] [--delay 10-20]
+                                         — фрагментация TLS ClientHello у клиентов (от блокировок по 443/TCP)
 vpn traffic [имя]                        — трафик пользователей по серверам: основной и каждая нода (ГБ)
 vpn refill                               — показывать в подписке дату обнуления трафика (--monthly); нужна
                                            короткая ссылка, сама включается при vpn reality self / sub-domain
@@ -3090,6 +3136,7 @@ promote) load_env; do_promote "$@" ;;
 repair) load_env; node_guard; do_repair ;;
 refill) load_env; node_guard; do_refill ;;
 traffic) load_env; node_guard; do_traffic "$@" ;;
+fragment) load_env; node_guard; do_fragment "$@" ;;
 _refill) load_env; is_node || refill_sync ;;
 _role) load_env; if is_node; then echo node; else echo main; fi ;;
 _nodes) load_env; if is_node; then echo "[]"; else node_list_json | jq -c '[.[] | {name, address, port}]'; fi ;;

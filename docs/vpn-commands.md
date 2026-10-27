@@ -725,6 +725,7 @@ sed -i "s|^TOKEN=.*|TOKEN='$T'|" /etc/vpn/vpn.env && vpn list
 | `vpn hop [on [от-до]\|off]` | port hopping для Hysteria2 |
 | `vpn fastest [on\|off] [--name Т] [--clients …]` | сервер «⚡ Лучший сервер» |
 | `vpn check [--local]` | диагностика |
+| `vpn fragment on\|off\|status [--packets P] [--length L] [--delay D]` | фрагментация TLS ClientHello у клиентов (JSON-подписка): от блокировок 443/TCP |
 | `vpn traffic [имя]` | трафик пользователей по серверам: основной и каждая нода |
 | `vpn refill` | дата обнуления трафика в подписке (заголовок `Subscription-Refill-Date`) |
 | `vpn repair` | вернуть в ссылки адрес этого сервера (после `vpn promote`) |
