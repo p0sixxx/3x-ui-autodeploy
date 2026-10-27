@@ -742,7 +742,7 @@ do_limit() {
             echo "Для новых пользователей: $(limits_text "${DEF_DEVICES:-0}" "${DEF_IPS:-0}")" ;;
         all)
             for e in $(all_emails | jq -r '.[]'); do
-                [[ "$e" == "$HC_USER" || "$e" == me ]] && continue
+                [[ "$e" == "$HC_USER" || "$e" == me || "$e" == rev-* ]] && continue
                 set_limits "$e"; n=$((n + 1))
             done
             echo "Применено к ${n} пользователям (кроме me)." ;;
@@ -1131,6 +1131,95 @@ do_fragment() { # on [--packets P] [--length L] [--delay D] | off | status — �
         if [[ -n "$fm" ]]; then echo "Фрагментация включена: $(jq -c '.tcp[0].settings' <<<"$fm" 2>/dev/null || echo "$fm")$( [[ "$(jq -r '.obj.subIncyFragmentationEnable // ""' <<<"$all")" == 1 ]] && echo "; в INCY — через его настройку")"
         else echo "Фрагментация выключена. Включить: vpn fragment on"; fi ;;
     *) echo "Использование: vpn fragment on [--packets tlshello] [--length 100-200] [--delay 10-20] | off | status"; exit 1 ;;
+    esac
+}
+# ---------------------------------------------------------------- обратный прокси: доступ в домашнюю сеть через этот сервер
+# Роутер дома (bridge) сам держит исходящее VLESS-подключение сюда под пользователем rev-<имя> с reverse.tag;
+# здесь Xray получает outbound rev-<имя>, и правило маршрутизации шлёт в него трафик выбранных пользователей
+# к домашней подсети. Белый IP дома не нужен.
+REVERSE_RAW=https://raw.githubusercontent.com/p0sixxx/3x-ui-autodeploy/main/router-bridge.sh
+xray_tpl_get() { # → JSON {xraySetting, outboundTestUrl}
+    local r; r=$(api POST /xray/); ok "$r"
+    jq -c '(if (.obj | type) == "string" then (.obj | fromjson) else .obj end) | {xraySetting, outboundTestUrl}' <<<"$r"
+}
+xray_tpl_set() { # <xraySetting JSON> <outboundTestUrl> — сохранить шаблон (Xray перечитает правила)
+    ok "$(api POST /xray/update --data-urlencode "xraySetting=$1" --data-urlencode "outboundTestUrl=$2")"
+}
+reverse_router_cmd() { # <имя> → команда для роутера (конфиг bridge в base64)
+    local name=$1 c rs cfg lan
+    c=$(get_client "rev-$name"); rs=$(reality_settings)
+    lan=$(jq -r '.comment // ""' <<<"$c" | grep -Eo '[0-9./]+/[0-9]+' | head -1); lan=${lan:-192.168.8.0/24}
+    cfg=$(jq -nc --arg a "$PUBLIC_HOST" --arg id "$(jq -r '.uuid' <<<"$c")" --arg sni "$(jq -r '.serverNames[0]' <<<"$rs")" \
+        --arg pbk "$(jq -r '.settings.publicKey' <<<"$rs")" --arg sid "$(jq -r '.shortIds[0]' <<<"$rs")" \
+        --argjson lan "$(jq -c 'split(",")' <<<"\"$lan\"")" '{
+        log: {loglevel: "warning"},
+        outbounds: [
+          {tag: "to-server", protocol: "vless",
+           settings: {address: $a, port: 443, id: $id, encryption: "none", flow: "xtls-rprx-vision", reverse: {tag: "r-in"}},
+           streamSettings: {network: "tcp", security: "reality",
+             realitySettings: {serverName: $sni, fingerprint: "chrome", publicKey: $pbk, shortId: $sid}}},
+          {tag: "lan", protocol: "freedom", settings: {finalRules: [{action: "allow"}]}},
+          {tag: "block", protocol: "blackhole"}],
+        routing: {rules: [
+          {type: "field", inboundTag: ["r-in"], ip: $lan, outboundTag: "lan"},
+          {type: "field", inboundTag: ["r-in"], outboundTag: "block"}]}}')
+    echo "wget -qO /tmp/rb.sh ${REVERSE_RAW} && sh /tmp/rb.sh $(printf '%s' "$cfg" | base64 -w0)"
+}
+do_reverse() { # add <имя> [--lan CIDR[,CIDR]] [--users a,b] | list | router <имя> | del <имя>
+    local act=${1:-list}; [[ $# -gt 0 ]] && shift
+    local name lan="192.168.8.0/24" users="me" a tag t tpl
+    case "$act" in
+    add)
+        name=${1:-}; [[ $# -gt 0 ]] && shift
+        [[ "$name" =~ ^[a-z0-9-]{1,20}$ ]] || { echo "Имя: латиница в нижнем регистре, цифры, - (например home)"; exit 1; }
+        while [[ $# -gt 0 ]]; do a=$1; shift; case "$a" in
+            --lan) lan=${1:-}; shift ;; --users) users=${1:-}; shift ;; *) echo "Неизвестный параметр: $a"; exit 1 ;; esac; done
+        [[ "$lan" =~ ^[0-9./,]+$ ]] || { echo "--lan: подсеть вида 192.168.8.0/24 (несколько — через запятую)"; exit 1; }
+        [[ -n "$(vless_id)" ]] || { echo "Нужен сервер VLESS (TCP + Reality) на этом сервере"; exit 1; }
+        for a in ${users//,/ }; do get_client "$a" >/dev/null; done
+        tag="rev-$name"
+        if ! api GET "/clients/get/$tag" | jq -e '.success == true' >/dev/null 2>&1; then
+            ok "$(api_json POST /clients/add "$(jq -nc --arg e "$tag" --arg sub "$(openssl rand -hex 8)" --arg cm "обратный прокси: $name, сеть $lan" \
+                --argjson ib "[$(vless_id)]" '{client: {email: $e, subId: $sub, flow: "xtls-rprx-vision", totalGB: 0, expiryTime: 0,
+                limitIp: 0, limitHwid: 0, tgId: 0, comment: $cm, enable: true, reverse: {tag: $e}}, inboundIds: $ib}')")"
+        else
+            save_client "$(get_client "$tag" | jq -c --arg cm "обратный прокси: $name, сеть $lan" '.comment = $cm')"
+        fi
+        t=$(xray_tpl_get); tpl=$(jq -r '.xraySetting | if type == "string" then fromjson else . end' <<<"$t")
+        tpl=$(jq -c --arg t "$tag" --argjson u "$(jq -c 'split(",")' <<<"\"$users\"")" --argjson ip "$(jq -c 'split(",")' <<<"\"$lan\"")" '
+            .routing.rules = ([{type: "field", ruleTag: ("vpn-" + $t), user: $u, ip: $ip, outboundTag: $t}]
+                + [(.routing.rules // [])[] | select(.ruleTag != ("vpn-" + $t))])' <<<"$tpl")
+        xray_tpl_set "$tpl" "$(jq -r '.outboundTestUrl' <<<"$t")"
+        echo "Готово на сервере: пользователи ${users} через этот сервер попадают в сеть ${lan} дома (через «${tag}»)."
+        echo
+        echo "Теперь на роутере дома (ssh root@192.168.8.1) выполни одну команду:"
+        echo
+        reverse_router_cmd "$name"
+        echo
+        echo "Она поставит Xray и службу xray-bridge; роутер сам подключится сюда. Проверка здесь: vpn reverse list"
+        echo "На телефоне: сервер «$(inbound_remark "$(vless_id)")» или другой сервер ЭТОГО сервера (не ноду и не «Лучший сервер» —"
+        echo "через ноды домашняя сеть недоступна), затем открывай адреса из ${lan} (например http://${lan%.*}.1)."
+        ;;
+    router) name=${1:-}; get_client "rev-$name" >/dev/null; reverse_router_cmd "$name" ;;
+    del)
+        name=${1:-}; tag="rev-$name"; get_client "$tag" >/dev/null
+        t=$(xray_tpl_get); tpl=$(jq -r '.xraySetting | if type == "string" then fromjson else . end' <<<"$t")
+        tpl=$(jq -c --arg t "$tag" '.routing.rules = [(.routing.rules // [])[] | select(.ruleTag != ("vpn-" + $t))]' <<<"$tpl")
+        xray_tpl_set "$tpl" "$(jq -r '.outboundTestUrl' <<<"$t")"
+        ok "$(api POST "/clients/del/$tag")"
+        echo "Обратный прокси «${name}» удалён. На роутере: sh /tmp/rb.sh remove (или wget -qO /tmp/rb.sh ${REVERSE_RAW} && sh /tmp/rb.sh remove)"
+        ;;
+    list)
+        local cl on
+        cl=$(api GET /clients/list); ok "$cl"
+        on=$(api POST /clients/onlines 2>/dev/null | jq -c '.obj // []' 2>/dev/null || echo '[]')
+        t=$(xray_tpl_get); tpl=$(jq -r '.xraySetting | if type == "string" then fromjson else . end' <<<"$t")
+        jq -r --argjson on "$on" --argjson tpl "$tpl" '.obj[] | select(.email | startswith("rev-")) | . as $c
+            | ($tpl.routing.rules // [] | map(select(.ruleTag == ("vpn-" + $c.email)))[0]) as $r
+            | "\(.email | ltrimstr("rev-"))  \(if ($on | index($c.email)) then "роутер подключён" else "роутер не в сети" end)  сеть: \($r.ip // ["?"] | join(","))  пользователи: \($r.user // ["?"] | join(","))"' <<<"$cl" | grep . \
+            || echo "Обратных прокси нет. Добавить: vpn reverse add home --lan 192.168.8.0/24 --users me"
+        ;;
+    *) echo "Использование: vpn reverse add <имя> [--lan 192.168.8.0/24] [--users me] | list | router <имя> | del <имя>"; exit 1 ;;
     esac
 }
 XUI_DB=${XUI_DB:-/etc/x-ui/x-ui.db}
@@ -2235,7 +2324,7 @@ node_sync() { # все пользователи → на все серверы �
     all=$(api GET /inbounds/list | jq -c '[.obj[]?.id]')
     env_set INBOUNDS "$(jq -c --argjson a "$all" '[.[] | select(. as $x | $a | index($x))]' <<<"$INBOUNDS")"
     ids=$(node_inbound_ids)
-    emails=$(all_emails)
+    emails=$(all_emails | jq -c '[.[] | select(startswith("rev-") | not)]')   # rev-* — обратный прокси, только на этом сервере
     local ibl nmap nname
     ibl=$(api GET /inbounds/list); nmap=$(node_list_json)
     for id in $(jq -r '.[]' <<<"$ids"); do
@@ -3070,6 +3159,8 @@ vpn check [--local]                      — полная диагностика
 vpn repair                               — починить адрес в ссылках своих серверов (после vpn promote)
 vpn fragment on|off|status [--packets tlshello] [--length 100-200] [--delay 10-20]
                                          — фрагментация TLS ClientHello у клиентов (от блокировок по 443/TCP)
+vpn reverse add <имя> [--lan 192.168.8.0/24] [--users me] | list | router <имя> | del <имя>
+                                         — доступ в домашнюю сеть без белого IP: роутер дома сам подключается сюда
 vpn traffic [имя]                        — трафик пользователей по серверам: основной и каждая нода (ГБ)
 vpn refill                               — показывать в подписке дату обнуления трафика (--monthly); нужна
                                            короткая ссылка, сама включается при vpn reality self / sub-domain
@@ -3137,6 +3228,7 @@ repair) load_env; node_guard; do_repair ;;
 refill) load_env; node_guard; do_refill ;;
 traffic) load_env; node_guard; do_traffic "$@" ;;
 fragment) load_env; node_guard; do_fragment "$@" ;;
+reverse) load_env; node_guard; do_reverse "$@" ;;
 _refill) load_env; is_node || refill_sync ;;
 _role) load_env; if is_node; then echo node; else echo main; fi ;;
 _nodes) load_env; if is_node; then echo "[]"; else node_list_json | jq -c '[.[] | {name, address, port}]'; fi ;;

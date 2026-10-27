@@ -726,6 +726,7 @@ sed -i "s|^TOKEN=.*|TOKEN='$T'|" /etc/vpn/vpn.env && vpn list
 | `vpn fastest [on\|off] [--name Т] [--clients …]` | сервер «⚡ Лучший сервер» |
 | `vpn check [--local]` | диагностика |
 | `vpn fragment on\|off\|status [--packets P] [--length L] [--delay D]` | фрагментация TLS ClientHello у клиентов (JSON-подписка): от блокировок 443/TCP |
+| `vpn reverse add <имя> [--lan CIDR] [--users me] \| list \| router <имя> \| del <имя>` | доступ в домашнюю сеть без белого IP (обратный прокси VLESS, роутер — `router-bridge.sh`) |
 | `vpn traffic [имя]` | трафик пользователей по серверам: основной и каждая нода |
 | `vpn refill` | дата обнуления трафика в подписке (заголовок `Subscription-Refill-Date`) |
 | `vpn repair` | вернуть в ссылки адрес этого сервера (после `vpn promote`) |
