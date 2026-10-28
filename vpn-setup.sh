@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # vpn-setup.sh — VPN-сервис на 3x-ui: VLESS+Reality (TCP/443) и Hysteria2 (UDP/443),
 # подписки, лимиты трафика и сроки на пользователя, утилита `vpn` (управление и диагностика).
-# Проверено с 3x-ui v3.9.0 (Xray 26.9.30). Целевая ОС: Ubuntu 24.04 (Debian 12 тоже должен работать).
+# Проверено с 3x-ui v3.11.0 (Xray 26.10.21) и v3.9.0 (Xray 26.9.30). Целевая ОС: Ubuntu 24.04 (Debian 12 тоже должен работать).
 #
 # Запуск:  bash <(curl -fsSL https://raw.githubusercontent.com/p0sixxx/3x-ui-autodeploy/main/vpn-setup.sh)
 #      или: bash vpn-setup.sh
@@ -28,12 +28,12 @@
 #   NO_FIREWALL=1              — не трогать ufw
 #   SKIP_EXTERNAL_CHECK=1      — не проверять порты снаружи (check-host.net)
 #   ASSUME_YES=1               — на все вопросы отвечать «да» (без интерактива)
-#   XUI_VERSION=v3.9.0         — версия 3x-ui
+#   XUI_VERSION=v3.11.0        — версия 3x-ui
 
 set -Eeuo pipefail
 trap 'echo -e "\n\033[0;31m[ОШИБКА] строка $LINENO: $BASH_COMMAND\033[0m" >&2' ERR
 
-XUI_VERSION="${XUI_VERSION:-v3.9.0}"
+XUI_VERSION="${XUI_VERSION:-v3.11.0}"
 # запасной список, если в сети хостера ничего не нашлось; Cloudflare/Google/Amazon/Microsoft не берём —
 # их SNI на чужом IP ТСПУ режет
 REALITY_CANDIDATES="www.samsung.com:443,www.nvidia.com:443,www.amd.com:443,www.intel.com:443,www.sony.com:443"
