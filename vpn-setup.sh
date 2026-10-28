@@ -994,8 +994,8 @@ self_nginx() { # <домен> <порт>
     if [[ -n "${SUB_SHORT:-}" && -n "${SUB_PATH:-}" ]]; then   # короткая ссылка подписки: https://домен/<ID>
         sub_loc="
     # подписка: https://$1/<ID> -> сервер подписок панели (ID: буквы, цифры, _ и -)
-    location ~ \"^/[A-Za-z0-9_-]{6,64}\$\" {
-        rewrite ^/(.*)\$ ${SUB_PATH%/}/\$1 break;
+    location ~ \"^/(?<vpn_sid>[A-Za-z0-9_-]{6,64})\$\" {
+        rewrite ^ ${SUB_PATH%/}/\$vpn_sid break;
         proxy_pass https://127.0.0.1:${SUB_PORT};
         add_header Subscription-Refill-Date \$vpn_refill always;
         proxy_set_header Host \$host;
@@ -1221,6 +1221,105 @@ do_reverse() { # add <имя> [--lan CIDR[,CIDR]] [--users a,b] | list | router 
         ;;
     *) echo "Использование: vpn reverse add <имя> [--lan 192.168.8.0/24] [--users me] | list | router <имя> | del <имя>"; exit 1 ;;
     esac
+}
+# ---------------------------------------------------------------- безопасность: проверка и закрытие уязвимых мест
+sec_pending() { # <пакет…> → «пакет текущая → новая» для тех, у кого есть обновление (apt-кэш уже обновлён)
+    apt-get -s -o Debug::NoLocking=1 install --only-upgrade "$@" 2>/dev/null | awk '/^Inst /{gsub(/[\[\]()]/,""); print $2" "$3" → "$4}'
+}
+sec_xui_latest() { curl -fsS --max-time 10 https://api.github.com/repos/MHSanaei/3x-ui/releases/latest 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null; }
+do_security() { # [fix]
+    local fix=${1:-} n_ok=0 n_warn=0 n_fail=0
+    s_ok() { echo "  [OK]   $*"; n_ok=$((n_ok + 1)); }
+    s_warn() { echo "  [WARN] $*"; n_warn=$((n_warn + 1)); }
+    s_fail() { echo "  [FAIL] $*"; n_fail=$((n_fail + 1)); }
+    if [[ "$fix" == fix ]]; then
+        echo "— Обновляю систему (пакеты безопасности, nginx, OpenSSH, ядро)…"
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq >/dev/null 2>&1 || true
+        apt-get -y -qq -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef upgrade >/dev/null 2>&1 \
+            && echo "  пакеты обновлены" || echo "  apt upgrade завершился с ошибкой — запусти вручную: apt upgrade"
+        if ! dpkg -s unattended-upgrades >/dev/null 2>&1; then apt-get -y -qq install unattended-upgrades >/dev/null 2>&1 || true; fi
+        printf 'APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "1";\n' > /etc/apt/apt.conf.d/20auto-upgrades
+        systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
+        echo "  автообновления безопасности включены (unattended-upgrades, раз в сутки)"
+        if [[ -f "$SELF_NGINX" ]] && grep -qE 'rewrite [^;]*\$[0-9]' "$SELF_NGINX"; then
+            self_nginx "$SELF_DOMAIN" "$SELF_PORT" && echo "  конфиг nginx пересобран: именованные группы вместо \$1"
+        fi
+        if [[ -n "${SUB_SHORT:-}" && -z "${SUB_CLOSED:-}" ]] && command -v ufw >/dev/null; then
+            ufw delete allow "${SUB_PORT}/tcp" >/dev/null 2>&1 || true; env_set SUB_CLOSED 1
+            echo "  порт подписок ${SUB_PORT}/tcp закрыт снаружи: подписка идёт через 443 (nginx). Вернуть: ufw allow ${SUB_PORT}/tcp"
+        fi
+        echo
+    else
+        apt-get update -qq >/dev/null 2>&1 || true
+    fi
+    echo "Проверка безопасности ($(date '+%d.%m.%Y %H:%M'), $(. /etc/os-release; echo "$PRETTY_NAME"))"
+    echo "— Система и пакеты"
+    local up nsec
+    for pk in nginx openssh-server; do
+        dpkg -s "$pk" >/dev/null 2>&1 || continue
+        up=$(sec_pending "$pk" | paste -sd, - | sed 's/,/, /g')
+        if [[ -n "$up" ]]; then s_fail "Есть обновление ${up} — в нём исправления уязвимостей: vpn security fix"
+        else s_ok "$pk $(dpkg-query -W -f='${Version}' "$pk") — последняя версия в репозитории"; fi
+    done
+    nsec=$(apt-get -s -o Debug::NoLocking=1 upgrade 2>/dev/null | grep '^Inst ' | grep -ci security || true)
+    (( nsec == 0 )) && s_ok "Неустановленных обновлений безопасности нет" || s_fail "Обновлений безопасности не установлено: ${nsec} — vpn security fix"
+    if [[ "$(apt-config dump 2>/dev/null | awk -F'"' '/^APT::Periodic::Unattended-Upgrade /{print $2}')" == 1 ]] && dpkg -s unattended-upgrades >/dev/null 2>&1; then
+        s_ok "Автообновления безопасности включены (unattended-upgrades)"
+    else s_warn "Автообновления безопасности выключены — vpn security fix включит"; fi
+    if [[ -f /var/run/reboot-required ]]; then s_warn "Нужна перезагрузка (обновилось ядро или библиотеки): reboot — VPN пропадёт на 1–2 минуты"
+    else s_ok "Перезагрузка не требуется"; fi
+    echo "— 3x-ui и Xray"
+    local cur latest xv
+    cur=$("$XUI_CLI" -v 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1); latest=$(sec_xui_latest)
+    xv=$(/usr/local/x-ui/bin/xray-linux-* -version 2>/dev/null | awk 'NR==1{print $2}')
+    if [[ -z "$latest" ]]; then s_warn "3x-ui ${cur:-?}: не удалось узнать последнюю версию (GitHub недоступен)"
+    elif [[ "v${cur}" == "$latest" ]]; then s_ok "3x-ui ${cur} — последняя версия (Xray ${xv:-?})"
+    else s_warn "3x-ui ${cur:-?}, вышла ${latest} (Xray ${xv:-?}) — обновить: vpn update-panel (сначала на нодах, потом на основном)"; fi
+    echo "— Доступ к серверу"
+    local pa prl
+    pa=$(sshd -T 2>/dev/null | awk '$1=="passwordauthentication"{print $2}'); prl=$(sshd -T 2>/dev/null | awk '$1=="permitrootlogin"{print $2}')
+    if [[ "$pa" == no ]]; then s_ok "SSH: вход только по ключу"
+    else s_warn "SSH: разрешён вход по паролю (root: ${prl:-?}). Надёжнее ключ: ssh-copy-id root@${SERVER_IP} с компьютера, затем здесь
+             printf 'PasswordAuthentication no\\nKbdInteractiveAuthentication no\\n' > /etc/ssh/sshd_config.d/10-vpn-keys.conf && systemctl reload ssh"; fi
+    if fail2ban-client status sshd >/dev/null 2>&1; then s_ok "fail2ban защищает SSH от перебора паролей"
+    else s_warn "fail2ban не следит за SSH: printf '[sshd]\\nenabled = true\\n' > /etc/fail2ban/jail.d/sshd.local && systemctl restart fail2ban"; fi
+    if is_node; then
+        if [[ -n "${PANEL_ALLOW:-}" ]]; then s_ok "Панель ноды доступна только основному серверу (${PANEL_ALLOW})"
+        else s_fail "Панель ноды (порт ${PANEL_PORT}) открыта всему интернету — оставь доступ только основному: vpn panel allow <IP основного>"; fi
+    elif [[ -n "${PANEL_HIDDEN:-}" ]]; then s_ok "Панель закрыта снаружи (только через ssh-туннель)"
+    elif [[ -n "${PANEL_ALLOW:-}" ]]; then s_ok "Панель доступна только с ${PANEL_ALLOW}"
+    else s_fail "Панель (порт ${PANEL_PORT}) открыта всему интернету — vpn panel hide"; fi
+    if [[ -n "${SUB_SHORT:-}" ]]; then
+        if [[ -n "${SUB_CLOSED:-}" ]]; then s_ok "Порт подписок ${SUB_PORT} закрыт снаружи, подписка — через 443"
+        else s_warn "Порт подписок ${SUB_PORT}/tcp открыт, хотя подписка идёт через 443 — vpn security fix закроет"; fi
+    fi
+    echo "— nginx (сайт-маскировка; снаружи достижим через 443 — Xray отдаёт ему чужие подключения)"
+    if [[ -f "$SELF_NGINX" ]]; then
+        if grep -qE 'rewrite [^;]*\$[0-9]' "$SELF_NGINX"; then s_warn "В конфиге rewrite с безымянной группой (\$1) — класс уязвимостей NGINX Rift: vpn security fix пересоберёт"
+        else s_ok "rewrite без безымянных групп"; fi
+        if grep -qE '^\s*(alias|ssi|aio|map \$[a-z_]+ \$[a-z_]+ \{\s*~)' "$SELF_NGINX" || grep -qE '^\s*~' "$SELF_NGINX"; then
+            s_warn "В конфиге есть alias/ssi/aio/regex-map — их затрагивают CVE октября 2026, держи nginx обновлённым"
+        else s_ok "Нет alias, SSI, AIO и regex-map (условия CVE-2026-15176/97205/93479/42533)"; fi
+        if grep -q "listen 127.0.0.1" "$SELF_NGINX"; then s_ok "nginx слушает только 127.0.0.1"; fi
+    else s_ok "nginx не используется"; fi
+    echo "Итог: ${n_ok} OK, ${n_warn} предупреждений, ${n_fail} проблем"
+    (( n_fail + n_warn == 0 )) || [[ "$fix" == fix ]] || echo "Исправить автоматически (обновления, автообновления, nginx, порт подписок): vpn security fix"
+}
+do_update_panel() { # [версия] — обновить 3x-ui с резервной копией базы
+    local tag=${1:-} cur bk
+    [[ -n "$tag" ]] || tag=$(sec_xui_latest)
+    [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Не удалось узнать версию. Укажи явно: vpn update-panel v3.11.0"; exit 1; }
+    cur=$("$XUI_CLI" -v 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    [[ "v$cur" != "$tag" ]] || { echo "3x-ui уже ${tag}"; return; }
+    bk=/root/x-ui-backup-$(date +%Y%m%d-%H%M)
+    mkdir -p "$bk"; cp -a /etc/x-ui/. "$bk/"; chmod 700 "$bk"
+    echo "3x-ui ${cur} → ${tag}. Резервная копия базы: ${bk}. VPN пропадёт на минуту…"
+    if ! XUI_UPDATE_TAG="$tag" bash <(curl -fsSL "https://raw.githubusercontent.com/MHSanaei/3x-ui/${tag}/update.sh") </dev/null > /var/log/vpn-update-xui.log 2>&1; then
+        tail -15 /var/log/vpn-update-xui.log; echo "Обновление не прошло (лог: /var/log/vpn-update-xui.log). Откат: systemctl stop x-ui; cp -a ${bk}/. /etc/x-ui/; переустановить ${cur}"; exit 1
+    fi
+    wait_panel || true
+    echo "Готово: 3x-ui $("$XUI_CLI" -v 2>/dev/null | head -1). Проверь: vpn check --local$(is_node && echo " (и на основном: vpn node)")"
 }
 XUI_DB=${XUI_DB:-/etc/x-ui/x-ui.db}
 do_traffic() { # [имя] — трафик пользователей по серверам: этот сервер и каждая нода (с последнего обнуления)
@@ -1472,6 +1571,7 @@ do_panel() { # [hide|show|status]
         fi ;;
     status)
         if [[ -n "${PANEL_HIDDEN:-}" ]]; then echo "Панель закрыта снаружи (слушает только 127.0.0.1:${PANEL_PORT})"
+        elif [[ -n "${PANEL_ALLOW:-}" ]]; then echo "Панель доступна только с ${PANEL_ALLOW}: порт ${PANEL_PORT}/tcp"
         else echo "Панель открыта снаружи: порт ${PANEL_PORT}/tcp"; fi ;;
     hide)
         if is_node; then echo "Это нода: главный сервер ходит в её панель по сети, закрывать нельзя."; exit 1; fi
@@ -1489,6 +1589,26 @@ do_panel() { # [hide|show|status]
         echo "Если у хостера есть свой фаервол, порт ${PANEL_PORT} там тоже можно закрыть."
         echo "Открыть панель: ssh -N -L ${PANEL_PORT}:127.0.0.1:${PANEL_PORT} root@${SERVER_IP}, затем $(panel_local_url)"
         echo "Вернуть как было: vpn panel show" ;;
+    allow) # allow <IP[,IP]> | allow all — порт панели в ufw только для этих адресов (нода: IP основного сервера)
+        local ips=${2:-} ip
+        [[ -n "$ips" ]] || { echo "Использование: vpn panel allow <IP основного сервера>[,IP…] | allow all"; exit 1; }
+        [[ -z "${PANEL_HIDDEN:-}" ]] || { echo "Панель закрыта (vpn panel hide) — ограничивать нечего"; exit 1; }
+        command -v ufw >/dev/null || { echo "Нет ufw"; exit 1; }
+        for ip in $(ufw status numbered | grep -E "^\[ *[0-9]+\] ${PANEL_PORT}/tcp " | grep -o '^\[ *[0-9]*' | tr -d '[ ' | sort -rn); do
+            ufw --force delete "$ip" >/dev/null 2>&1 || true
+        done
+        if [[ "$ips" == all ]]; then
+            ufw allow "${PANEL_PORT}/tcp" comment 3x-ui-panel >/dev/null; env_set PANEL_ALLOW ""
+            echo "Порт панели ${PANEL_PORT}/tcp открыт для всех."
+        else
+            for ip in ${ips//,/ }; do
+                [[ "$ip" =~ ^[0-9a-fA-F.:/]+$ ]] || { echo "Не похоже на IP: $ip"; exit 1; }
+                ufw allow from "$ip" to any port "$PANEL_PORT" proto tcp comment 3x-ui-panel >/dev/null
+            done
+            env_set PANEL_ALLOW "$ips"
+            echo "Порт панели ${PANEL_PORT}/tcp открыт только для: ${ips}. Остальным интернетом панель не видна."
+            is_node && echo "Если основной сервер сменится (vpn promote) — выполни здесь vpn panel allow <IP нового основного>."
+        fi ;;
     show)
         [[ -n "${PANEL_HIDDEN:-}" ]] || { echo "Панель и так открыта снаружи"; return; }
         local all upd
@@ -1500,7 +1620,7 @@ do_panel() { # [hide|show|status]
         restart_panel
         wait_panel
         echo "Панель снова открыта: ${PANEL_URL}" ;;
-    *) echo "Использование: vpn panel [hide|show|status]"; exit 1 ;;
+    *) echo "Использование: vpn panel [hide|show|status|allow <IP>|allow all]"; exit 1 ;;
     esac
 }
 
@@ -2050,7 +2170,8 @@ r_fail() { echo -e "  ${c_r}[FAIL]${c_0} $*"; N_FAIL=$((N_FAIL + 1)); }
 listening() { local f=-ltn; [[ $2 == udp ]] && f=-lun; [[ -n "$(ss -H "$f" "sport = :$1" 2>/dev/null)" ]]; }
 
 do_check() {
-    local pp=$PANEL_PORT; [[ -z "${PANEL_HIDDEN:-}" ]] || pp=""   # закрытую снаружи панель не проверяем извне
+    local pp=$PANEL_PORT; [[ -z "${PANEL_HIDDEN:-}" && -z "${PANEL_ALLOW:-}" ]] || pp=""   # закрытую/ограниченную панель не проверяем извне
+    local sp=$SUB_PORT; [[ -z "${SUB_CLOSED:-}" ]] || sp=""   # порт подписок закрыт: подписка идёт через 443 (nginx)
     local external=${1:-yes} st r
     echo "Диагностика VPN ($(date '+%d.%m.%Y %H:%M'))"
 
@@ -2088,7 +2209,7 @@ do_check() {
     fi
     if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
         local miss="" p s; s=$(ufw status)
-        for p in 80/tcp 443/tcp 443/udp ${pp:+"${pp}/tcp"} "${SUB_PORT}/tcp" ${XHTTP_PORT:+"${XHTTP_PORT}/tcp"} ${H3_PORT:+"${H3_PORT}/udp"}; do grep -q "^${p} " <<<"$s" || miss+=" $p"; done
+        for p in 80/tcp 443/tcp 443/udp ${pp:+"${pp}/tcp"} ${sp:+"${sp}/tcp"} ${XHTTP_PORT:+"${XHTTP_PORT}/tcp"} ${H3_PORT:+"${H3_PORT}/udp"}; do grep -q "^${p} " <<<"$s" || miss+=" $p"; done
         [[ -z "$miss" ]] && r_ok "ufw: нужные порты открыты" || r_fail "ufw: не открыты:${miss} (ufw allow <порт>)"
     else
         r_warn "ufw выключен (работать будет, но сервер без фаервола)"
@@ -2273,7 +2394,7 @@ do_check() {
     if [[ "$external" == yes ]]; then
         echo "— Доступность снаружи (check-host.net)"
         local out port ru w ru_ok ru_all w_ok w_all name
-        if out=$(probe "$SERVER_IP" 443 ${XHTTP_PORT:+"$XHTTP_PORT"} "$SUB_PORT" ${pp:+"$pp"} 80); then
+        if out=$(probe "$SERVER_IP" 443 ${XHTTP_PORT:+"$XHTTP_PORT"} ${sp:+"$sp"} ${pp:+"$pp"} 80); then
             while read -r port ru w; do
                 case "$port" in 443) name="443/tcp (VLESS)";; 80) name="80/tcp (продление сертификата)";;
                     "${XHTTP_PORT:-x}") name="${port}/tcp (VLESS XHTTP)";;
@@ -3161,6 +3282,10 @@ vpn fragment on|off|status [--packets tlshello] [--length 100-200] [--delay 10-2
                                          — фрагментация TLS ClientHello у клиентов (от блокировок по 443/TCP)
 vpn reverse add <имя> [--lan 192.168.8.0/24] [--users me] | list | router <имя> | del <имя>
                                          — доступ в домашнюю сеть без белого IP: роутер дома сам подключается сюда
+vpn security [fix]                       — проверка безопасности: обновления, версии, SSH, открытые панели, nginx;
+                                           fix — поставить обновления, включить автообновления, закрыть лишнее
+vpn update-panel [v3.x.y]                — обновить 3x-ui (с резервной копией базы); сначала ноды, потом основной
+vpn panel allow <IP>|all                 — пускать в панель только с этих IP (на ноде — IP основного сервера)
 vpn traffic [имя]                        — трафик пользователей по серверам: основной и каждая нода (ГБ)
 vpn refill                               — показывать в подписке дату обнуления трафика (--monthly); нужна
                                            короткая ссылка, сама включается при vpn reality self / sub-domain
@@ -3229,6 +3354,8 @@ refill) load_env; node_guard; do_refill ;;
 traffic) load_env; node_guard; do_traffic "$@" ;;
 fragment) load_env; node_guard; do_fragment "$@" ;;
 reverse) load_env; node_guard; do_reverse "$@" ;;
+security) load_env; do_security "$@" ;;
+update-panel) load_env; do_update_panel "$@" ;;
 _refill) load_env; is_node || refill_sync ;;
 _role) load_env; if is_node; then echo node; else echo main; fi ;;
 _nodes) load_env; if is_node; then echo "[]"; else node_list_json | jq -c '[.[] | {name, address, port}]'; fi ;;
