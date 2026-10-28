@@ -28,12 +28,14 @@
 #   NO_FIREWALL=1              — не трогать ufw
 #   SKIP_EXTERNAL_CHECK=1      — не проверять порты снаружи (check-host.net)
 #   ASSUME_YES=1               — на все вопросы отвечать «да» (без интерактива)
-#   XUI_VERSION=v3.11.0        — версия 3x-ui
+#   XUI_VERSION=latest         — версия 3x-ui: latest (по умолчанию) — последний релиз с GitHub,
+#                                или конкретная, например v3.11.0
 
 set -Eeuo pipefail
 trap 'echo -e "\n\033[0;31m[ОШИБКА] строка $LINENO: $BASH_COMMAND\033[0m" >&2' ERR
 
-XUI_VERSION="${XUI_VERSION:-v3.11.0}"
+XUI_VERSION="${XUI_VERSION:-latest}"
+XUI_TESTED=v3.11.0   # последняя версия 3x-ui, с которой проверен скрипт (и запасная, если GitHub API не ответил)
 # запасной список, если в сети хостера ничего не нашлось; Cloudflare/Google/Amazon/Microsoft не берём —
 # их SNI на чужом IP ТСПУ режет
 REALITY_CANDIDATES="www.samsung.com:443,www.nvidia.com:443,www.amd.com:443,www.intel.com:443,www.sony.com:443"
@@ -379,7 +381,23 @@ external_precheck() {
 }
 
 # =========================================================================== 5. 3x-ui
+xui_resolve_version() { # XUI_VERSION=latest → тег последнего релиза 3x-ui
+    [[ "$XUI_VERSION" == latest ]] || return 0
+    local t
+    t=$(curl -fsS --max-time 15 https://api.github.com/repos/MHSanaei/3x-ui/releases/latest 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null || true)
+    if [[ "$t" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        XUI_VERSION=$t
+        if [[ "$(printf '%s\n%s\n' "${XUI_TESTED#v}" "${t#v}" | sort -V | tail -1)" != "${XUI_TESTED#v}" ]]; then
+            warn "3x-ui ${t} новее проверенной ${XUI_TESTED} — после установки всё проверит vpn check. Поставить проверенную: XUI_VERSION=${XUI_TESTED}"
+        fi
+    else
+        XUI_VERSION=$XUI_TESTED
+        warn "Не удалось узнать последнюю версию 3x-ui (GitHub API) — ставлю проверенную ${XUI_TESTED}"
+    fi
+}
+
 install_xui() {
+    xui_resolve_version
     log "Устанавливаю 3x-ui ${XUI_VERSION} (2–3 минуты)"
     local inst; inst=$(mktemp)
     curl -fsSL "https://raw.githubusercontent.com/MHSanaei/3x-ui/${XUI_VERSION}/install.sh" -o "$inst" \
