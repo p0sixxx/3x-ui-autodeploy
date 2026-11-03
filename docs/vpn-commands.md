@@ -728,6 +728,7 @@ sed -i "s|^TOKEN=.*|TOKEN='$T'|" /etc/vpn/vpn.env && vpn list
 | `vpn fragment on\|off\|status [--packets P] [--length L] [--delay D]` | фрагментация TLS ClientHello у клиентов (JSON-подписка): от блокировок 443/TCP |
 | `vpn reverse add <имя> [--lan CIDR] [--users me] \| list \| router <имя> \| del <имя>` | доступ в домашнюю сеть без белого IP (обратный прокси VLESS, роутер — `router-bridge.sh`) |
 | `vpn security [fix]` | проверка безопасности (обновления, версии, SSH, открытые панели, nginx); `fix` — исправить |
+| `vpn xray-update [vX.Y.Z]` | обновить ядро Xray на этом сервере (через 3x-ui) |
 | `vpn update-panel [v3.x.y]` | обновить 3x-ui с резервной копией `/etc/x-ui` |
 | `vpn panel allow <IP>\|all` | панель только для этих IP (на ноде — IP основного сервера) |
 | `vpn traffic [имя]` | трафик пользователей по серверам: основной и каждая нода |

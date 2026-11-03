@@ -1244,6 +1244,45 @@ do_reverse() { # add <имя> [--lan CIDR[,CIDR]] [--users a,b] | list | router 
 sec_pending() { # <пакет…> → «пакет текущая → новая» для тех, у кого есть обновление (apt-кэш уже обновлён)
     apt-get -s -o Debug::NoLocking=1 install --only-upgrade "$@" 2>/dev/null | awk '/^Inst /{gsub(/[\[\]()]/,""); print $2" "$3" → "$4}'
 }
+sec_xray_latest() { curl -fsS --max-time 10 https://api.github.com/repos/XTLS/Xray-core/releases/latest 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null; }
+sec_xray_bin() { compgen -G '/usr/local/x-ui/bin/xray-linux-*' | head -1; }
+# CVE-2026-98432 (ядро Linux, IPv4 TCP use-after-free, удалённый root): показанная атака — через MPTCP-слушатели,
+# а Go 1.24+ (Xray, 3x-ui) по умолчанию слушает с MPTCP. Защита до нового ядра: запрет MPTCP и сброс TCP с IP-опциями.
+IPOPTS_UNIT=/etc/systemd/system/vpn-ipopts.service
+mptcp_harden() {
+    printf '# vpn security: CVE-2026-98432 — MPTCP не нужен VPN\nnet.mptcp.enabled = 0\n' > /etc/sysctl.d/90-vpn-mptcp.conf
+    sysctl -q -w net.mptcp.enabled=0 2>/dev/null || true
+    command -v nft >/dev/null || { DEBIAN_FRONTEND=noninteractive apt-get -y -qq install nftables >/dev/null 2>&1 || true; }
+    if command -v nft >/dev/null; then
+        cat > "$IPOPTS_UNIT" <<'UNIT'
+[Unit]
+Description=vpn security: drop inbound TCP with IPv4 options (CVE-2026-98432)
+After=network-pre.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'nft delete table ip vpn_ipopts 2>/dev/null; nft add table ip vpn_ipopts && nft add chain ip vpn_ipopts input "{ type filter hook input priority -300; }" && nft add rule ip vpn_ipopts input meta l4proto tcp ip hdrlength != 5 drop'
+ExecStop=/bin/sh -c 'nft delete table ip vpn_ipopts 2>/dev/null || true'
+[Install]
+WantedBy=multi-user.target
+UNIT
+        systemctl daemon-reload; systemctl enable --now vpn-ipopts >/dev/null 2>&1 || systemctl restart vpn-ipopts >/dev/null 2>&1 || true
+    fi
+    systemctl restart x-ui   # Xray и панель заново открывают порты — уже обычным TCP
+    wait_panel >/dev/null 2>&1 || true
+}
+do_xray_update() { # [vX.Y.Z] — обновить ядро Xray через панель 3x-ui (на этом сервере)
+    local tag=${1:-} cur r
+    [[ -n "$tag" ]] || tag=$(sec_xray_latest)
+    [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Не удалось узнать версию Xray. Укажи явно: vpn xray-update v26.10.31"; exit 1; }
+    cur=$("$(sec_xray_bin)" -version 2>/dev/null | awk 'NR==1{print $2}')
+    [[ "v$cur" != "$tag" ]] || { echo "Xray уже ${tag}"; return; }
+    echo "Xray ${cur:-?} → ${tag} (VPN моргнёт на пару секунд)…"
+    r=$(api POST "/server/installXray/${tag}" --max-time 300); ok "$r"
+    wait_panel >/dev/null 2>&1 || true; sleep 2
+    echo "Готово: Xray $("$(sec_xray_bin)" -version 2>/dev/null | awk 'NR==1{print $2}'). Проверка: vpn check --local"
+    echo "Обнови Xray на каждом сервере отдельно (ноды — тоже): у каждой 3x-ui своё ядро."
+}
 sec_xui_latest() { curl -fsS --max-time 10 https://api.github.com/repos/MHSanaei/3x-ui/releases/latest 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null; }
 do_security() { # [fix]
     local fix=${1:-} n_ok=0 n_warn=0 n_fail=0
@@ -1260,6 +1299,7 @@ do_security() { # [fix]
         printf 'APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "1";\n' > /etc/apt/apt.conf.d/20auto-upgrades
         systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
         echo "  автообновления безопасности включены (unattended-upgrades, раз в сутки)"
+        mptcp_harden && echo "  MPTCP выключен, TCP с IPv4-опциями отбрасывается (CVE-2026-98432); панель и Xray перезапущены"
         if [[ -f "$SELF_NGINX" ]] && grep -qE 'rewrite [^;]*\$[0-9]' "$SELF_NGINX"; then
             self_nginx "$SELF_DOMAIN" "$SELF_PORT" && echo "  конфиг nginx пересобран: именованные группы вместо \$1"
         fi
@@ -1294,6 +1334,19 @@ do_security() { # [fix]
     if [[ -z "$latest" ]]; then s_warn "3x-ui ${cur:-?}: не удалось узнать последнюю версию (GitHub недоступен)"
     elif [[ "v${cur}" == "$latest" ]]; then s_ok "3x-ui ${cur} — последняя версия (Xray ${xv:-?})"
     else s_warn "3x-ui ${cur:-?}, вышла ${latest} (Xray ${xv:-?}) — обновить: vpn update-panel (сначала на нодах, потом на основном)"; fi
+    local xl xc
+    xl=$(sec_xray_latest); xc=$("$(sec_xray_bin)" -version 2>/dev/null | awk 'NR==1{print $2}')
+    if [[ -n "$xl" && -n "$xc" && "v$xc" != "$xl" ]]; then s_warn "Xray ${xc}, вышла ${xl} (в 26.10.31 — защита от CVE-2026-98432) — vpn xray-update"
+    elif [[ -n "$xc" ]]; then s_ok "Xray ${xc}$( [[ -n "$xl" ]] && echo " — последняя версия")"; fi
+    echo "— Ядро Linux: CVE-2026-98432 (удалённый root через TCP; атака показана на MPTCP-слушателях)"
+    local mp ml
+    mp=$(sysctl -n net.mptcp.enabled 2>/dev/null || echo 0); ml=$(ss -H -lMn 2>/dev/null | grep -c . || true)
+    echo "  ядро: $(uname -r)"
+    if [[ "$mp" == 0 ]]; then s_ok "MPTCP выключен (net.mptcp.enabled = 0)"
+    else s_fail "MPTCP включён, слушателей с MPTCP: ${ml} (Xray и 3x-ui на Go 1.24+) — vpn security fix выключит"; fi
+    if nft list table ip vpn_ipopts >/dev/null 2>&1; then s_ok "Входящие TCP-пакеты с IPv4-опциями отбрасываются (основной путь атаки)"
+    else s_fail "Нет фильтра TCP с IPv4-опциями — vpn security fix добавит (службой vpn-ipopts)"; fi
+    s_warn "Исправленное ядро: ставь, как только выйдет в обновлениях Ubuntu (apt upgrade / vpn security fix), затем reboot. Пока — защита выше"
     echo "— Доступ к серверу"
     local pa prl
     pa=$(sshd -T 2>/dev/null | awk '$1=="passwordauthentication"{print $2}'); prl=$(sshd -T 2>/dev/null | awk '$1=="permitrootlogin"{print $2}')
@@ -3302,6 +3355,7 @@ vpn reverse add <имя> [--lan 192.168.8.0/24] [--users me] | list | router <и
                                          — доступ в домашнюю сеть без белого IP: роутер дома сам подключается сюда
 vpn security [fix]                       — проверка безопасности: обновления, версии, SSH, открытые панели, nginx;
                                            fix — поставить обновления, включить автообновления, закрыть лишнее
+vpn xray-update [vX.Y.Z]                 — обновить ядро Xray на этом сервере (через 3x-ui)
 vpn update-panel [v3.x.y]                — обновить 3x-ui (с резервной копией базы); сначала ноды, потом основной
 vpn panel allow <IP>|all                 — пускать в панель только с этих IP (на ноде — IP основного сервера)
 vpn traffic [имя]                        — трафик пользователей по серверам: основной и каждая нода (ГБ)
@@ -3374,6 +3428,7 @@ fragment) load_env; node_guard; do_fragment "$@" ;;
 reverse) load_env; node_guard; do_reverse "$@" ;;
 security) load_env; do_security "$@" ;;
 update-panel) load_env; do_update_panel "$@" ;;
+xray-update) load_env; do_xray_update "$@" ;;
 _refill) load_env; is_node || refill_sync ;;
 _role) load_env; if is_node; then echo node; else echo main; fi ;;
 _nodes) load_env; if is_node; then echo "[]"; else node_list_json | jq -c '[.[] | {name, address, port}]'; fi ;;
