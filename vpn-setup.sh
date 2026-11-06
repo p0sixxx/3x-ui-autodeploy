@@ -962,7 +962,17 @@ SELF_DIR=/etc/vpn/self
 SELF_WWW=/var/www/vpn-self
 SELF_NGINX=/etc/nginx/conf.d/vpn-self.conf
 ACME_SH=${ACME_SH:-/root/.acme.sh/acme.sh}
-self_ipv4() { { getent ahostsv4 "$1" 2>/dev/null || true; } | awk '{print $1}' | sort -u | xargs; }
+self_ipv4() { # как домен видят публичные DNS (их же спрашивает Let's Encrypt); локальный кэш может помнить старый IP
+    local r
+    if command -v dig >/dev/null; then
+        r=$({ dig +short +time=3 +tries=1 A "$1" @1.1.1.1; dig +short +time=3 +tries=1 A "$1" @8.8.8.8; } 2>/dev/null | grep -E '^[0-9.]+$' | sort -u | xargs)
+    fi
+    if [[ -z "$r" ]]; then
+        resolvectl flush-caches >/dev/null 2>&1 || true
+        r=$({ getent ahostsv4 "$1" 2>/dev/null || true; } | awk '{print $1}' | sort -u | xargs)
+    fi
+    echo "$r"
+}
 self_ipv6() { { getent ahostsv6 "$1" 2>/dev/null || true; } | awk '$1 !~ /^::ffff:/ {print $1}' | sort -u | xargs; }
 self_https_ok() { # <домен> <порт> — сайт отвечает по TLS с проверкой сертификата и по HTTP/2
     [[ "$(curl -s --noproxy '*' -o /dev/null --max-time 8 --http2 -w '%{http_version}' --resolve "$1:$2:127.0.0.1" "https://$1:$2/" 2>/dev/null)" == 2 ]]
