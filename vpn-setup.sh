@@ -2393,11 +2393,11 @@ do_check() {
     target=$(jq -r '.target // .dest // empty' <<<"$rs" 2>/dev/null || true)
     sni=$(jq -r '.serverNames[0] // empty' <<<"$rs" 2>/dev/null || true)
     if [[ "$target" == 127.0.0.1:* ]]; then
-        local sp=${target##*:} sips send sleft
+        local selfp=${target##*:} sips send sleft
         sips=$(self_ipv4 "$sni")
         if [[ " $sips " == *" ${SERVER_IP} "* ]]; then r_ok "Свой домен ${sni} указывает на сервер (${SERVER_IP})"
         else r_fail "A-запись ${sni} указывает на ${sips:-ничего}, а не на ${SERVER_IP} — исправь у регистратора"; fi
-        if self_https_ok "$sni" "$sp"; then r_ok "Сайт-маскировка ${sni} (${target}): TLS с действительным сертификатом и HTTP/2"
+        if self_https_ok "$sni" "$selfp"; then r_ok "Сайт-маскировка ${sni} (${target}): TLS с действительным сертификатом и HTTP/2"
         else r_fail "Сайт-маскировка ${sni} на ${target} не отвечает (systemctl status nginx) — повторить: vpn reality self ${sni}"; fi
         if [[ -s "$SELF_DIR/fullchain.pem" ]]; then
             send=$(openssl x509 -in "$SELF_DIR/fullchain.pem" -noout -enddate 2>/dev/null | cut -d= -f2)
@@ -2475,12 +2475,12 @@ do_check() {
             || r_fail "Hysteria2: клиент не смог выйти в интернет через сервер"
     fi
     if [[ -n "${nlinks:-}" ]]; then
-        local nlink nname2 sp=10880
+        local nlink nname2 socks=10880
         while IFS= read -r nlink; do
             [[ "$nlink" =~ ^(vless|hysteria2):// ]] || continue
             nname2=$(python3 -c 'import sys,urllib.parse as u; print(u.unquote(sys.argv[1].split("#",1)[1]) if "#" in sys.argv[1] else "?")' "$nlink" 2>/dev/null || echo "?")
-            sp=$((sp + 1))
-            ip_out=$(e2e "$nlink" "$sp")
+            socks=$((socks + 1))
+            ip_out=$(e2e "$nlink" "$socks")
             [[ -n "$ip_out" ]] && r_ok "Нода: ${nname2} работает, выход в интернет с IP ${ip_out}" \
                 || r_fail "Нода: ${nname2} — клиент не смог выйти в интернет через неё"
         done <<<"$nlinks"
