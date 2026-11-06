@@ -2000,6 +2000,26 @@ do_repair() {
     else echo "Адреса в ссылках в порядке (${PUBLIC_HOST})."; fi
     echo "Проверка: vpn check --local"
 }
+do_label() { # <новое название> — переименовать свои серверы (VLESS, Hysteria2, XHTTP…) в приложениях
+    local lbl="$*" id rem base n=0
+    if [[ -z "$lbl" ]]; then
+        echo "Сейчас:"; api GET /inbounds/list | jq -r '.obj[]? | select(.nodeId == null) | "  " + .remark'
+        echo "Использование: vpn label \"🇫🇮 Финляндия 2\"  — сменить название серверов этого сервера в приложениях"; exit 1
+    fi
+    while IFS=$'\t' read -r id rem; do
+        [[ -n "$id" ]] || continue
+        base=$(name_base "$rem")
+        [[ "$base" != "$rem" ]] || continue   # без названия протокола — не наш сервер, не трогаю
+        inbound_patch "$id" '.remark = $r' --arg r "${lbl}${rem#"$base"}"
+        echo "  «${rem}» → «${lbl}${rem#"$base"}»"; n=$((n + 1))
+    done < <(api GET /inbounds/list | jq -r '.obj[]? | select(.nodeId == null) | "\(.id)\t\(.remark)"')
+    (( n > 0 )) || { echo "Не нашёл серверов для переименования."; exit 1; }
+    env_set SERVER_LABEL "$lbl"
+    if [[ -n "${NODE:-}" ]] || [[ -f "$VPN_DIR/node-add.txt" ]]; then
+        echo "Это нода: главный сервер подхватит новые названия при синхронизации (до пары минут)."
+    fi
+    echo "В клиентах обнови подписку."
+}
 balancer_form() { # <name> → аргументы curl для create/update балансировщика
     local id
     printf '%s\0' --data-urlencode "remark=$1" -d strategy=leastPing -d sortOrder=1 -d enabled=true
@@ -3379,6 +3399,7 @@ vpn del <имя>                            — удалить
 vpn panel [hide|show|status]             — адрес и логин панели; hide — закрыть панель снаружи (доступ через ssh-туннель)
 vpn check [--local]                      — полная диагностика (--local: без проверки снаружи)
 vpn repair                               — починить адрес в ссылках своих серверов (после vpn promote)
+vpn label "🇫🇮 Финляндия 2"               — название серверов этого сервера (или ноды) в приложениях
 vpn fragment on|off|status [--packets tlshello] [--length 100-200] [--delay 10-20]
                                          — фрагментация TLS ClientHello у клиентов (от блокировок по 443/TCP)
 vpn reverse add <имя> [--lan 192.168.8.0/24] [--users me] | list | router <имя> | del <имя>
@@ -3452,6 +3473,7 @@ http3) load_env; do_http3 "$@" ;;
 node) load_env; do_node "$@" ;;
 promote) load_env; do_promote "$@" ;;
 repair) load_env; node_guard; do_repair ;;
+label) load_env; do_label "$@" ;;
 refill) load_env; node_guard; do_refill ;;
 traffic) load_env; node_guard; do_traffic "$@" ;;
 fragment) load_env; node_guard; do_fragment "$@" ;;

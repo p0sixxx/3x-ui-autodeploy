@@ -434,6 +434,7 @@ vpn promote --nodes root@IP_НОДЫ2,root@IP_НОДЫ3 --sub-link https://cdn.�
 | `vpn fastest [on\|off\|status] [--name Т] [--clients …] [--interval --sampling --timeout]` | сервер «⚡ Лучший сервер» |
 | `vpn check [--local]` | полная диагностика (`--local` — без проверки снаружи) |
 | `vpn repair` | вернуть в ссылки адрес этого сервера (после `vpn promote`) |
+| `vpn label "🇫🇮 Финляндия 2"` | название серверов этого сервера или ноды в приложениях (запускать на нём самом) |
 | `vpn fragment on\|off\|status` | фрагментация TLS ClientHello у клиентов (от блокировок 443/TCP) |
 | `vpn reverse add <имя> [--lan CIDR] [--users me] \| list \| router <имя> \| del <имя>` | доступ в домашнюю сеть без белого IP: роутер сам подключается к серверу |
 | `vpn security [fix]` | проверка безопасности; `fix` — обновления, автообновления, nginx, порт подписок |
