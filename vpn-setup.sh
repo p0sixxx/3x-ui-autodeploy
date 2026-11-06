@@ -215,7 +215,12 @@ net_checks() {
 
     SERVER_IP=$(detect_ip)
     [[ -n "$SERVER_IP" ]] || die "Не удалось определить публичный IPv4"
-    if ip -4 -o addr show scope global | grep -qw "$SERVER_IP"; then
+    local on_if="" t
+    for t in 1 2 3 4 5; do   # сразу после загрузки DHCP может ещё переполучать адрес
+        ip -4 -o addr show scope global | grep -qwF "$SERVER_IP" && { on_if=1; break; }
+        sleep 2
+    done
+    if [[ -n "$on_if" ]]; then
         ok "Публичный IP: $SERVER_IP (на интерфейсе сервера)"
     else
         warn "Публичный IP $SERVER_IP не висит на интерфейсе — сервер за NAT. Порты должны быть проброшены (проверю снаружи)."
