@@ -1551,7 +1551,11 @@ sub_short_possible() { # <домен> — домен Reality на 443: чере�
     [[ "$(jq -r .port <<<"$ib")" == 443 ]] || return 1
     [[ "$(jq -r '.streamSettings | (if type == "string" then fromjson else . end) | .realitySettings | (.target // .dest)' <<<"$ib")" == "127.0.0.1:${SELF_PORT}" ]]
 }
-sub_first_id() { api GET /clients/list | jq -r '[.obj[]? | select(.subId != null and .subId != "")][0].subId // empty'; }
+sub_first_id() { # ID подписки для проверки: healthcheck, иначе включённый пользователь без лимита устройств
+    # (подписку с лимитом устройств сервер отдаёт только клиентам с ID устройства — curl его не шлёт)
+    api GET /clients/list | jq -r --arg hc "$HC_USER" '[.obj[]? | select((.subId // "") != "" and .enable != false)]
+        | ((map(select(.email == $hc)) + map(select((.limitHwid // 0) == 0 and (.email | startswith("rev-") | not))))[0].subId) // empty'
+}
 do_subdomain() { # <домен> [--port] | off | status
     node_guard
     local act=${1:-status} all path
