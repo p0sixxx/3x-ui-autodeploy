@@ -25,6 +25,7 @@
 #   FASTEST=0                  — не создавать сервер «Лучший сервер» (по умолчанию создаётся)
 #   NODE=1                     — поставить как ноду для главной панели: без своих пользователей,
 #                                в конце печатает команду «vpn node add …» для главного сервера
+#   LABEL="🇫🇮 Финляндия 2"    — название сервера в приложениях (по умолчанию флаг и страна по IP)
 #   NO_FIREWALL=1              — не трогать ufw
 #   SKIP_EXTERNAL_CHECK=1      — не проверять порты снаружи (check-host.net)
 #   ASSUME_YES=1               — на все вопросы отвечать «да» (без интерактива)
@@ -3612,7 +3613,8 @@ main() {
     net_checks
     choose_params
     install_cli
-    SERVER_LABEL=$(SERVER_IP="$SERVER_IP" vpn _country 2>/dev/null || echo "Сервер")
+    SERVER_LABEL=${LABEL:-}
+    [[ -n "$SERVER_LABEL" ]] || SERVER_LABEL=$(SERVER_IP="$SERVER_IP" vpn _country 2>/dev/null || echo "Сервер")
     [[ -n "$SERVER_LABEL" ]] || SERVER_LABEL="Сервер"
     ok "Сервер: ${SERVER_LABEL}"
     setup_firewall

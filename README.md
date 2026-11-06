@@ -89,6 +89,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/p0sixxx/3x-ui-autodeploy/mai
 | `TG_BOT_TOKEN=…` + `TG_ADMIN_ID=…` | Telegram-бот 3x-ui: уведомления и бэкапы |
 | `ACME_EMAIL=you@mail` | e-mail для Let's Encrypt |
 | `NO_FIREWALL=1` | не настраивать ufw |
+| `LABEL="🇫🇮 Финляндия 2"` | название сервера в приложениях (по умолчанию флаг и страна по IP); две ноды в одной стране — `LABEL="🇫🇮 Финляндия 2"`. Уже установленный сервер: `vpn brand --vless-name … --hy2-name … --xhttp-name …` |
 | `SKIP_EXTERNAL_CHECK=1` | не проверять порты снаружи через check-host.net |
 | `ASSUME_YES=1` | на все вопросы отвечать «да» (установка без участия человека) |
 | `XUI_VERSION=v3.11.0` | конкретная версия 3x-ui вместо последней (`latest`, по умолчанию) |
