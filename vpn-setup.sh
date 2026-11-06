@@ -137,6 +137,9 @@ reinstall_cleanup() {
     ok "Бэкап старой установки: $bk"
     systemctl disable --now x-ui >/dev/null 2>&1 || true
     rm -rf /usr/local/x-ui /etc/x-ui /etc/systemd/system/x-ui.service /usr/bin/x-ui "$VPN_DIR" /usr/local/bin/vpn
+    # конфиг nginx от прошлой установки ссылается на удалённые сертификаты из $VPN_DIR — nginx с ним не запустится
+    rm -f /etc/nginx/conf.d/vpn-self.conf /etc/cron.d/vpn-refill
+    systemctl restart nginx >/dev/null 2>&1 || true
     systemctl daemon-reload
     sleep 1
     ok "Старая установка удалена"
@@ -1010,6 +1013,11 @@ self_nginx_install() { # до выпуска сертификата: acme.sh в�
         rm -f /etc/nginx/sites-enabled/default
         systemctl restart nginx >/dev/null 2>&1 || true
     fi
+    # конфиг, оставшийся от прошлой установки (сертификатов уже нет), не даёт nginx запуститься
+    if [[ -f "$SELF_NGINX" ]] && ! nginx -t >/dev/null 2>&1; then
+        rm -f "$SELF_NGINX"
+        systemctl restart nginx >/dev/null 2>&1 || true
+    fi
     systemctl enable nginx >/dev/null 2>&1 || true
     systemctl is-active --quiet nginx 2>/dev/null || systemctl start nginx >/dev/null 2>&1 || true
 }
@@ -1453,7 +1461,8 @@ do_refill() { # vpn refill — включить заголовок даты об
     echo "Обновляется сама раз в час. Клиенты покажут её после обновления подписки (если умеют, например Happ)."
 }
 self_reload() { # команда после выпуска/продления сертификата Reality-домена
-    local c="systemctl reload nginx"
+    # если nginx почему-то не запущен — запустить, а не провалить установку сертификата
+    local c="systemctl reload nginx || systemctl restart nginx || true"
     # серверу подписок нужен рестарт, он читает сертификат только при старте
     if [[ "${SUB_CERT:-}" == "$SELF_DIR/fullchain.pem" ]]; then c="$c; systemctl restart x-ui"; fi
     echo "$c"
