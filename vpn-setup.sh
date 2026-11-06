@@ -1538,7 +1538,8 @@ sub_apply() { # <subURI> <cert> <key> — записать в панель и п
 sub_tls_ok() { # <домен> — сервер подписок отвечает по HTTPS с проверкой сертификата
     local i
     for i in 1 2 3 4 5; do
-        curl -s --noproxy '*' -o /dev/null --max-time 8 "https://$1:${SUB_PORT}/" 2>/dev/null && return 0
+        # проверяем именно этот сервер: сразу после смены DNS домен может ещё указывать на старый
+        curl -s --noproxy '*' -o /dev/null --max-time 8 --resolve "$1:${SUB_PORT}:127.0.0.1" "https://$1:${SUB_PORT}/" 2>/dev/null && return 0
         sleep 1
     done
     return 1
@@ -1617,7 +1618,7 @@ do_subdomain() { # <домен> [--port] | off | status
             else
                 local i
                 for i in 1 2 3 4 5; do
-                    [[ "$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 10 "https://${d}/${sid}" 2>/dev/null)" == 200 ]] && { code=0; break; }
+                    [[ "$(curl -s --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 10 --resolve "${d}:443:127.0.0.1" "https://${d}/${sid}" 2>/dev/null)" == 200 ]] && { code=0; break; }
                     sleep 1
                 done
             fi
